@@ -209,3 +209,6 @@ __marimo__/
 
 credentials.json
 secrets.yml
+client_secrets.json
+bot_secret.json
+bot_service.json
