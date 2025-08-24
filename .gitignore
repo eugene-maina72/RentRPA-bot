@@ -211,6 +211,7 @@ credentials.json
 secrets.toml
 .venv/
 client_secrets.json
+client_secret.json
 bot_secret.json
 bot_service.json
 .streamlit

@@ -1,9 +1,6 @@
-# streamlit_app.py
-# Loading necessary libraries
 
-import json
-import time
-import base64
+# streamlit_app.py (v2) — quota-hardened
+import json, time, base64, re
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -11,15 +8,16 @@ from datetime import datetime
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
 import gspread
-from google_auth_oauthlib.helpers import session_from_client_config
+from gspread.exceptions import APIError
 from gspread.utils import ValueInputOption
 
-from bot_logic import (
-    PATTERN,
-    parse_email,
-    update_tenant_month_row,
-    PAYMENT_COLS,
+from bot_logic_merged import (
+                 PATTERN, 
+                 parse_email, 
+                 update_tenant_month_row, 
+                 PAYMENT_COLS
 )
 
 # ---------- Streamlit UI config ----------
@@ -28,53 +26,59 @@ st.title("🏠 Rent RPA — Gmail → Google Sheets")
 st.caption("User-owned OAuth. Writes payment info from Gmail to your rent tracker sheet.")
 st.divider()
 st.header("About")
-
 st.markdown("""
-A Streamlit app that scans your Gmail for rent payment emails (e.g. from NCBA) and logs them into a Google Sheet.
-- **Gmail**: Uses Gmail API to search for emails matching your query, and extracts payment details using regex.
-- **Google Sheets**: Uses Google Sheets API to append payment records to your rent tracker sheet, creating tenant sheets as needed.
-- **OAuth**: Uses OAuth 2.0 for secure access to your Gmail and Google Sheets data. You control the permissions.
-- **No backend**: Runs entirely in Streamlit with user-owned credentials. No data is stored on any server.
+Scans Gmail for rent payment emails and logs them into a Google Sheet.
+- OAuth 2.0 (your account, your tokens)
+- Gmail API for search + parsing
+- Google Sheets API for appends/updates
 """)
 
 # ---------- OAuth config from Streamlit Secrets ----------
-CLIENT_ID     = st.secrets["google_oauth"]["client_id"]
-CLIENT_SECRET = st.secrets["google_oauth"]["client_secret"]
-REDIRECT_URI  = st.secrets["google_oauth"]["redirect_uri"]
-
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly"
 ]
+ENV            = st.secrets.get("ENV", "local")
+CLIENT_ID      = st.secrets["google_oauth"]["client_id"]
+CLIENT_SECRET  = st.secrets["google_oauth"]["client_secret"]
+REDIRECT_LOCAL = st.secrets["google_oauth"]["redirect_uri_local"]
+REDIRECT_PROD  = st.secrets["google_oauth"]["redirect_uri_prod"]
+REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
-# ---------- OAuth helpers ----------
 def build_flow():
     client_config = {
         "web": {
             "client_id": CLIENT_ID,
-            "project_id": "rent-rpa",
+            "project_id": "Rent-rpa",
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_secret": CLIENT_SECRET,
             "redirect_uris": [REDIRECT_URI],
-            # optional but nice to have:
-            "javascript_origins": [REDIRECT_URI.rstrip("/")],
         }
     }
     return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
-#---------- OAuth state in Streamlit session ----------
 def get_creds():
     if "creds_json" in st.session_state:
         return Credentials.from_authorized_user_info(json.loads(st.session_state["creds_json"]), SCOPES)
     return None
 
-# Store creds in session state
-def store_creds(creds):
+def store_creds(creds: Credentials):
     st.session_state["creds_json"] = creds.to_json()
 
-# Handle OAuth callback
+# OAuth: refresh if possible
+creds = get_creds()
+if creds and not creds.valid and creds.refresh_token:
+    try:
+        creds.refresh(Request())
+        store_creds(creds)
+    except Exception:
+        creds = None
+
+# Callback before gate
 params = st.query_params
 if "code" in params and "state" in params and "creds_json" not in st.session_state:
     flow = build_flow()
@@ -83,14 +87,15 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
     store_creds(creds)
     st.query_params.clear()
     st.success("Signed in to Google successfully.")
+    st.rerun()
 
-creds = get_creds()
+# Auth gate
 if not creds or not creds.valid:
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent"
+        include_granted_scopes="true",  # must be string per Google API
+        prompt="consent",
     )
     st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
     st.stop()
@@ -105,24 +110,34 @@ gmail_query = st.text_input(
     value='PAYLEMAIYAN subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
     help='Use Gmail operators. Add "is:unread" when confident.'
 )
-colA, colB, colC = st.columns([1,1,1])
+colA, colB, colC, colD = st.columns([1,1,1,1])
 with colA:
     mark_read = st.checkbox("Mark processed emails as Read", value=True)
 with colB:
     throttle_ms = st.number_input("Throttle per Sheets write (ms)", min_value=0, value=250, step=50)
 with colC:
     max_results = st.number_input("Max messages to scan", min_value=10, max_value=500, value=200, step=10)
+with colD:
+    batch_size = st.number_input("Append batch size", min_value=10, max_value=200, value=50, step=10)
 
 run = st.button("▶️ Run Bot", type="primary", use_container_width=True)
 st.divider()
 
-
-# ---------- Main logic ----------
+# ---------- Helpers ----------
 def extract_sheet_id(url: str) -> str:
     try:
         return url.split("/d/")[1].split("/")[0]
     except Exception:
         return ""
+
+def _decode_base64url(data: str) -> str:
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding).decode("utf-8", errors="ignore")
+
+def _strip_html(html: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text
 
 def get_message_text(service, msg_id):
     msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
@@ -133,7 +148,9 @@ def get_message_text(service, msg_id):
         data = part.get("body", {}).get("data")
         parts = part.get("parts", [])
         if mime == "text/plain" and data:
-            body_texts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore"))
+            body_texts.append(_decode_base64url(data))
+        elif mime == "text/html" and data and not body_texts:
+            body_texts.append(_strip_html(_decode_base64url(data)))
         for p in parts or []:
             walk(p)
     walk(payload)
@@ -141,7 +158,21 @@ def get_message_text(service, msg_id):
         return "\n".join(body_texts)
     return msg.get("snippet", "")
 
-# Run bot
+# Backoff wrapper for Sheets calls that may 429
+def with_backoff(fn, *args, **kwargs):
+    delay = 1.0
+    for i in range(6):  # ~1+2+4+8+16+32 = 63s worst case
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            if hasattr(e, "response") and e.response.status_code == 429:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    return fn(*args, **kwargs)
+
+# ---------- Main ----------
 if run:
     if not sheet_url:
         st.error("Please paste your Google Sheet URL.")
@@ -155,7 +186,7 @@ if run:
     gmail = build("gmail", "v1", credentials=creds)
     gspread_client = gspread.authorize(creds)
 
-    # Open sheet (user must be owner/editor)
+    # Open sheet
     try:
         sh = gspread_client.open_by_key(sheet_id)
     except Exception as e:
@@ -167,15 +198,15 @@ if run:
         try:
             ws = sh.worksheet(ws_name)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(ws_name, rows=2000, cols=max(10, len(header)))
+            ws = sh.add_worksheet(title=ws_name, rows=2000, cols=max(10, len(header)))
             ws.append_row(header)
         return ws
 
     refs_ws = ensure_meta("ProcessedRefs", ["Ref"])
     hist_ws = ensure_meta("PaymentHistory", PAYMENT_COLS + ['AccountCode','TenantSheet','Month'])
 
-    # Load processed refs
-    ref_vals = refs_ws.get_all_values()
+    # Load processed refs (normalize case)
+    ref_vals = with_backoff(refs_ws.get_all_values)
     processed_refs = set((r[0] or '').upper() for r in ref_vals[1:]) if len(ref_vals) > 1 else set()
 
     st.write("🔎 Searching Gmail…")
@@ -191,7 +222,8 @@ if run:
             if not pay:
                 errors.append(f"Could not parse message id {m['id']}")
                 continue
-            if pay['REF Number'] in processed_refs:
+            ref_norm = (pay.get('REF Number','') or '').upper()
+            if ref_norm in processed_refs:
                 continue
             parsed.append((m["id"], pay))
         except Exception as e:
@@ -199,49 +231,48 @@ if run:
 
     st.success(f"Parsed {len(parsed)} new payments.")
 
-    # Process each payment
-    st.write("✍️ Updating Google Sheet…")
-    logs = []
+    # Map worksheets, lazy-create when first seen
     worksheets = {ws.title: ws for ws in sh.worksheets()}
-
     def find_or_create_tenant_sheet(account_code: str):
-        for title, ws in worksheets.items():
-            t = title.upper()
-            if t.startswith(account_code) and 'PROCESSEDREFS' not in t and 'PAYMENTHISTORY' not in t:
+        acct = (account_code or '').strip().upper()
+        for title, ws in list(worksheets.items()):
+            t = title.strip().upper()
+            if t.startswith(acct) and 'PROCESSEDREFS' not in t and 'PAYMENTHISTORY' not in t:
                 return ws
         title = f"{account_code} - AutoAdded"
-        ws = sh.add_worksheet(title, rows=1000, cols=12)
-        ws.update(values=[['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties']],
-                  range_name='A1', value_input_option=ValueInputOption.user_entered)
-        ws.format('1:1', {'textFormat': {'bold': True}})
-        ws.freeze(rows=1)
+        ws = sh.add_worksheet(title=title, rows=1000, cols=12)
+        with_backoff(ws.update, range_name='A1',
+                     values=[['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties']],
+                     value_input_option=ValueInputOption.user_entered)
+        try:
+            ws.format('1:1', {'textFormat': {'bold': True}})
+            ws.freeze(rows=1)
+        except Exception:
+            pass
         worksheets[title] = ws
-        logs.append(f"➕ Created tenant sheet: {title}")
+        st.info(f"➕ Created tenant sheet: {title}")
         return ws
 
-    for msg_id, p in parsed:
+    # Prepare batched appends
+    history_rows = []
+    ref_rows = []
+    logs = []
+
+    for idx, (msg_id, p) in enumerate(parsed, start=1):
         ws = find_or_create_tenant_sheet(p["AccountCode"])
         info = update_tenant_month_row(ws, p)
 
-        # Quota-safe log (don’t read computed cells)
         logs.append(
-            f"🧾 {info['sheet']} R{info['month_row']} | "
-            f"Paid {info['paid_before']}→{info['paid_after']} | "
-            f"Ref {info['ref_added']} | formulas set: {info['formulas_set']}"
+            f"🧾 {info['sheet']} R{info['month_row']} | Paid {info['paid_before']}→{info['paid_after']} | Ref {info['ref_added']} | formulas set: {info['formulas_set']}"
         )
 
-        # PaymentHistory append
         dt = datetime.strptime(p["Date Paid"], "%d/%m/%Y %I:%M %p")
         mon = dt.strftime("%Y-%m")
-        
-        hist_ws.append_row(
-            [p[k] for k in PAYMENT_COLS] + [p['AccountCode'], ws.title, mon],
-            value_input_option=ValueInputOption.user_entered
-        )
+        history_rows.append([p[k] for k in PAYMENT_COLS] + [p['AccountCode'], ws.title, mon])
 
-        # ProcessedRefs append
-        refs_ws.append_row([p["REF Number"]], value_input_option=ValueInputOption.raw)
-        processed_refs.add(p["REF Number"])
+        ref_val = (p.get("REF Number","") or "").upper()
+        ref_rows.append([ref_val])
+        processed_refs.add(ref_val)
 
         if mark_read:
             try:
@@ -254,8 +285,13 @@ if run:
         if throttle_ms > 0:
             time.sleep(throttle_ms / 1000.0)
 
-    # Show grouped PaymentHistory
-    hist_vals = hist_ws.get_all_values()
+        if len(history_rows) >= batch_size or idx == len(parsed):
+            with_backoff(hist_ws.append_rows, history_rows, value_input_option=ValueInputOption.user_entered)
+            history_rows.clear()
+            with_backoff(refs_ws.append_rows, ref_rows, value_input_option=ValueInputOption.raw)
+            ref_rows.clear()
+
+    hist_vals = with_backoff(hist_ws.get_all_values)
     if len(hist_vals) > 1:
         df = pd.DataFrame(hist_vals[1:], columns=hist_vals[0])
         with pd.option_context('display.float_format', '{:,.2f}'.format):
@@ -270,7 +306,6 @@ if run:
         st.info("No PaymentHistory yet.")
 
     st.success("Done.")
-
     st.subheader("Run Log")
     if logs:
         st.code("\n".join(logs), language="text")
