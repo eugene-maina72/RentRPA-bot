@@ -11,6 +11,7 @@ from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 import gspread
 from gspread.utils import rowcol_to_a1
+from dateutil.relativedelta import relativedelta
 
 # ---------------- CONFIG ----------------
 CLIENT_SECRET = 'bot_secret.json'        # Gmail OAuth Desktop credentials
@@ -22,6 +23,7 @@ GMAIL_QUERY   = 'subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d'  # t
 PAYMENT_COLS  = ['Date Paid','Amount Paid','REF Number','Payer','Phone','Payment Mode']
 MAX_PHONE_LEN = 13
 REF_LEN       = 10
+
 
 # ----- AUTH -----
 gmail_flow = InstalledAppFlow.from_client_secrets_file(
@@ -128,6 +130,7 @@ ALIASES = {
 
 REQUIRED_KEYS = ["month","amount_due","amount_paid","date_paid","ref","date_due","prepay_arrears","penalties"]
 
+# --- Helper to score header row ---
 def _score_header(row_norm):
     """How many required columns does this row satisfy?"""
     hits = 0
@@ -136,6 +139,7 @@ def _score_header(row_norm):
             hits += 1
     return hits
 
+# --- Helper to map row tokens to column keys ---
 def _header_map_from_row(row):
     """Return (colmap) by matching normalized row tokens against aliases."""
     row_norm = [_norm(c) for c in row]
@@ -147,6 +151,8 @@ def _header_map_from_row(row):
                 break
     return colmap
 
+
+# --- Helper to detect or create a header row ---
 def _detect_or_create_header(ws):
     """
     Find a header row in the first 10 rows.
@@ -194,10 +200,13 @@ def _detect_or_create_header(ws):
         ws.insert_row(header, index=1, value_input_option="USER_ENTERED")
     return 0, header, _header_map_from_row(header)
 
+
+# --- Helper to convert date string to month key ---
 def _month_key_from_date_str(date_str):
     dt = datetime.strptime(date_str, '%d/%m/%Y %I:%M %p')
     return dt.strftime('%B-%Y'), dt   # e.g., January-2025
 
+# --- Helper to find the month row in values ---
 def _find_month_row(values, month_col_idx, month_key):
     for r in range(1, len(values)):  # skip header at 0
         cell = str(values[r][month_col_idx]).strip()
@@ -208,48 +217,66 @@ def _find_month_row(values, month_col_idx, month_key):
             return r
     return None
 
+# --- Helper to convert row/col to letter(s) ---
+def _col_letter(row, col):
+    """Return column letter(s) for a given 1-based row/col using A1 conversion."""
+    return re.sub(r'\d+', '', rowcol_to_a1(row, col))
+
+
+# --- Main function to update tenant month row ---
 def update_tenant_month_row(tenant_ws, payment):
     """
-    Robust: detects header row (not necessarily row 1), matches flexible labels,
-    writes only Amount paid, Date paid, REF Number, and updates computed Prepayment/Arrears + Penalties.
+    Realtime version:
+      - Writes ONLY: Amount paid, Date paid, REF Number
+      - Sets once-per-row formulas for:
+          Prepayment/Arrears = N(Amount paid) - N(Amount Due)
+          Penalties          = IF(DATEVALUE(LEFT(DatePaid,10)) > DATEVALUE(DateDue)+2, 3000, 0)
     """
-    # 1) Detect header row or create one
-    header_row0, header, colmap = _detect_or_create_header(tenant_ws)
 
-    # Validate required keys
+    # --- detect/insert header (uses your robust detector from the previous block) ---
+    header_row0, header, colmap = _detect_or_create_header(tenant_ws)
     missing = [k for k in REQUIRED_KEYS if k not in colmap]
     if missing:
         raise ValueError(f"Sheet '{tenant_ws.title}' missing required columns after normalization: {missing}")
 
-    # 2) Fetch all values from header_row down so index math stays simple
+    # Reload values from header row downward
     all_vals = tenant_ws.get_all_values()
-    vals = all_vals[header_row0:]           # 0 -> header row
-    base_row_1based = header_row0 + 1       # actual sheet row number of header
+    vals = all_vals[header_row0:]
+    base_row_1based = header_row0 + 1
 
-    # 3) Target month row
+    # --- find or create the month row ---
     month_key, pay_dt = _month_key_from_date_str(payment['Date Paid'])
     row_rel = _find_month_row(vals, colmap['month'], month_key)
     if row_rel is None:
-        # append a new month row at the end (relative to vals)
         new_row = [''] * len(header)
         new_row[colmap['month']] = month_key
         new_row[colmap['amount_due']] = '0'
         new_row[colmap['amount_paid']] = '0'
         new_row[colmap['date_paid']] = ''
         new_row[colmap['ref']] = ''
-        new_row[colmap['date_due']] = ''
-        new_row[colmap['prepay_arrears']] = '0'
-        new_row[colmap['penalties']] = '0'
+        # Set Date due as the previous row's date due plus one month.
+        # Try to get last row's Date due (skip header row)
+        if len(vals) > 1 and vals[-1][colmap['date_due']]:
+            try:
+                last_date_due = datetime.strptime(vals[-1][colmap['date_due']], "%d/%m/%Y").replace(day=5)
+                new_date_due = last_date_due + relativedelta(months=1)
+            except Exception:
+            # Fallback to payment date plus one month if parsing fails
+                new_date_due = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p') + relativedelta(months=1)
+        else:
+            new_date_due = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p') + relativedelta(months=1)
+            new_row[colmap['date_due']] = new_date_due.strftime("%d/%m/%Y")
+            
+        # prepay/arrears and penalties will be set as FORMULAS after append
         tenant_ws.append_row(new_row, value_input_option='USER_ENTERED')
-        # refresh window
         all_vals = tenant_ws.get_all_values()
         vals = all_vals[header_row0:]
         row_rel = len(vals) - 1
 
-    # 4) Read row numbers and values
     row_abs_1based = base_row_1based + row_rel
     row = vals[row_rel]
 
+    # --- helpers to coerce numbers/strings ---
     def _num(v):
         try:
             s = str(v).replace(',','').strip()
@@ -259,55 +286,25 @@ def update_tenant_month_row(tenant_ws, payment):
     def _str(v):
         return '' if v is None else str(v)
 
+    # current row values
     due0   = _num(row[colmap['amount_due']])
     paid0  = _num(row[colmap['amount_paid']])
-    bal0   = _num(row[colmap['prepay_arrears']])  # +ve prepay, -ve arrears
     ref0   = _str(row[colmap['ref']])
-    date_due_str = _str(row[colmap['date_due']])
-    pen0   = _num(row[colmap['penalties']])
 
     pay_amt = float(payment['Amount Paid'])
 
-    # 5) Allocation: arrears first; leftover to Amount paid
-    if bal0 < 0:
-        arrears = -bal0
-        used = min(pay_amt, arrears)
-        bal1 = bal0 + used
-        rem  = pay_amt - used
-        paid1 = paid0 + max(0.0, rem)
-    else:
-        bal1  = bal0
-        paid1 = paid0 + pay_amt
+    # (if you previously tracked arrears carryover in this cell, you can ignore that here
+    #  because the balance is now a live formula: Paid - Due)
+    paid1 = paid0 + pay_amt
 
-    # Final balance
-    bal_final = (bal1 >= 0) and (paid1 - due0) or bal1
+    # --- 1) write the three direct fields ---
+    updates = {
+        colmap['amount_paid']:  paid1,
+        colmap['date_paid']:    payment['Date Paid'],
+        colmap['ref']:          (payment['REF Number'] if not ref0 else f"{ref0}, {payment['REF Number']}")
+    }
 
-    # 6) REF & Date paid
-    ref_new = payment['REF Number'] if not ref0 else f"{ref0}, {payment['REF Number']}"
-    date_paid_new = payment['Date Paid']
-
-    # 7) Late penalty (>6 days after Date due and still underpaid at payment time)
-    penalty_add = 0.0
-    if date_due_str:
-        try:
-            due_dt = datetime.strptime(date_due_str.strip(), '%d/%m/%Y')
-            if pay_dt > (due_dt + timedelta(days=6)) and paid1 < due0:
-                penalty_add = 3000.0
-        except Exception:
-            pass
-    pen_final = pen0 + penalty_add
-
-    # 8) Write back (compact contiguous update of touched cells)
-    updates = {}
-    def put(col_key, value):
-        updates[colmap[col_key]] = value
-
-    put('amount_paid', paid1)
-    put('date_paid', date_paid_new)
-    put('ref', ref_new)
-    put('prepay_arrears', bal_final)
-    put('penalties', pen_final)
-
+    # compact range write
     touched = sorted(updates.keys())
     c1 = touched[0] + 1
     c2 = touched[-1] + 1
@@ -322,21 +319,61 @@ def update_tenant_month_row(tenant_ws, payment):
             tenant_ws.update(values=[payload], range_name=rng, value_input_option='USER_ENTERED')
             break
         except HttpError as e:
-            if e.resp.status == 429:
+            if getattr(e, "resp", None) and e.resp.status == 429:
                 time.sleep(5 * (attempt+1))
                 continue
             raise
 
+    # --- 2) ensure the formula cells are present (set once; they’ll recalc automatically) ---
+    col_letters = {k: _col_letter(row_abs_1based, colmap[k] + 1) for k in colmap}
+    # addresses for this row:
+    amt_paid_addr = f"{col_letters['amount_paid']}{row_abs_1based}"
+    amt_due_addr  = f"{col_letters['amount_due']}{row_abs_1based}"
+    date_paid_addr= f"{col_letters['date_paid']}{row_abs_1based}"
+    date_due_addr = f"{col_letters['date_due']}{row_abs_1based}"
+    bal_addr      = f"{col_letters['prepay_arrears']}{row_abs_1based}"
+    pen_addr      = f"{col_letters['penalties']}{row_abs_1based}"
+
+
+    # Penalties formula: if DatePaid > DateDue + 2 days, penalty = 3000
+    pen_formula = f"=IF(DATEVALUE(LEFT({date_paid_addr},10))>DATEVALUE({date_due_addr})+2, 3000, 0)"
+
+    # Balance formula: if first data row, =N(amt_paid)-N(amt_due); else, =N(prev_bal)+N(amt_paid)-N(amt_due)
+    if row_abs_1based == base_row_1based:
+        bal_formula = f"=N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
+    else:
+        prev_bal_addr = f"{col_letters['prepay_arrears']}{row_abs_1based-1}"
+        bal_formula = f"=N({prev_bal_addr})+N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
+    
+
+    # Only set if not already a formula (so we don't overwrite intentional manual values)
+    current_bal = tenant_ws.acell(bal_addr).value or ""
+    current_pen = tenant_ws.acell(pen_addr).value or ""
+    needs_bal = not str(current_bal).startswith("=")
+    needs_pen = not str(current_pen).startswith("=")
+
+    # Set any missing formulas in a single batch
+    body = []
+    if needs_bal:
+        body.append({'range': bal_addr, 'values': [[bal_formula]]})
+    if needs_pen:
+        body.append({'range': pen_addr, 'values': [[pen_formula]]})
+    if body:
+        tenant_ws.batch_update(body, value_input_option='USER_ENTERED')
+
+    # Return info (no computed numbers now—Sheet will reflect in realtime)
     return {
         'sheet': tenant_ws.title,
         'month_row': row_abs_1based,
-        'due': due0,
         'paid_before': paid0,
         'paid_after': paid1,
-        'prepay_arrears_after': bal_final,
-        'penalties_added': penalty_add,
         'ref_added': payment['REF Number'],
+        'formulas_set': {'balance': needs_bal, 'penalties': needs_pen},
+        'balance_addr': bal_addr,    
+        'penalties_addr': pen_addr       
     }
+
+
 
 # ----- META SHEETS (ProcessedRefs, PaymentHistory) -----
 def ensure_meta(ws_name, header):
@@ -401,9 +438,13 @@ def find_or_create_tenant_sheet(account_code: str):
 for msg_id, p in parsed:
     tenant_ws = find_or_create_tenant_sheet(p['AccountCode'])
     info = update_tenant_month_row(tenant_ws, p)
-
-    logs.append(f"🧾 {info['sheet']} R{info['month_row']} | Paid {info['paid_before']}→{info['paid_after']} | "
-                f"Bal {info['prepay_arrears_after']} | +Penalty {info['penalties_added']} | Ref {info['ref_added']}")
+    # Read the live, recalculated values
+    logs.append(
+    f"🧾 {info['sheet']} R{info['month_row']} | "
+    f"Paid {info['paid_before']}→{info['paid_after']} | "
+    f"Ref {info['ref_added']} | Bal/penalties will auto-update in sheet"
+    )
+    
     tenant_tally[info['sheet']] = tenant_tally.get(info['sheet'], 0) + 1
 
     # PaymentHistory
@@ -424,7 +465,7 @@ for msg_id, p in parsed:
     except HttpError:
         pass
 
-    time.sleep(0.25)  # throttle writes
+    time.sleep(2)  # throttle writes
 
 # ----- GROUPED MONTHLY SUMMARY (display) -----
 hist_vals = hist_ws.get_all_values()

@@ -1,5 +1,7 @@
 # 📊 Rental Income Record keeping Automation Bot 🏠
 
+<img src="images/rent%20bot.jpg" alt="Rent bot" width="400"/>
+
 ***
 Automate your apartment rent payment tracking using this Streamlit-based RPA bot. The bot fetches MPESA Paybill payment notifications from Gmail and updates a Google Sheet in real-time—no manual logging, no spreadsheet headaches!
 
@@ -7,7 +9,7 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 
 * 🔑 Secure Google OAuth 2.0 Login – No need to store passwords.
 
-* 📩 Fetches MPESA Payment Emails – Automatically pulls NCBA transaction notifications.
+* 📩 Fetches MPESA Payment Emails – Automatically pulls bank transaction notifications.
 
 * 📄 Parses Payment Details – Extracts Amount, Payer Name, Reference Code, etc.
 
@@ -21,11 +23,15 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 
 ```bash
 
-/lemaiyan-rent-bot/
+/RentRPA-bot/
 │
+├── data
+├── images
+├── LICENSE
+├── RentRPA.ipynb
 ├── README.md                # This file
 ├── requirements.txt         # Python dependencies
-├── client_secret.json       # Google OAuth2.0 credentials (keep this private!)
+├── prototype.py             # Prototype program(Local running)
 ├── streamlit_app.py         # Main Streamlit UI file
 └── bot_functions.py         # Backend logic for email parsing & Sheets updating
 
@@ -37,8 +43,8 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 
     ```bash
 
-    git clone https://github.com/your-username/lemaiyan-rent-bot.git
-    cd lemaiyan-rent-bot
+    git clone https://github.com/eugene-maina72/RentRAP-bot
+    cd RentRAP-bot
 
     ```
 
@@ -121,4 +127,5 @@ This project is licensed under the MIT License.
 
 Eugene Maina
 Data Scientist | RPA Developer
-[LinkedIn] | [GitHub] | [Email]
+
+* [LinkedIn](https://www.linkedin.com/in/eugene-maina-4a8b9a128/) | [GitHub](https://github.com/eugene-maina72) | [Email](mailto:eugenemaina72@gmail.com)

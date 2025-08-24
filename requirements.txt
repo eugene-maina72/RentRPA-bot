@@ -1,0 +1,10 @@
+streamlit==1.37.0
+pandas>=2.0.0
+google-auth==2.33.0
+google-auth-oauthlib==1.2.0
+google-api-python-client==2.141.0
+gspread==6.1.2
+httplib2>=0.22.0
+requests>=2.31.0
+python-dateutil>=2.8.2
+oauth2client==4.1.3
