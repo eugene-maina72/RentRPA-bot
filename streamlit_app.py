@@ -58,15 +58,11 @@ def build_flow():
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_secret": CLIENT_SECRET,
             "redirect_uris": [REDIRECT_URI],
+            # optional but nice to have:
+            "javascript_origins": [REDIRECT_URI.rstrip("/")],
         }
     }
-    oauth2session = session_from_client_config(client_config, SCOPES)
-    return Flow(
-        client_config=client_config,
-        redirect_uri=REDIRECT_URI,
-        client_type="web",
-        oauth2session=oauth2session
-    )
+    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
 #---------- OAuth state in Streamlit session ----------
 def get_creds():
@@ -106,7 +102,7 @@ sheet_url = st.text_input(
 )
 gmail_query = st.text_input(
     "Gmail search query:",
-    value='subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
+    value='PAYLEMAIYAN subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
     help='Use Gmail operators. Add "is:unread" when confident.'
 )
 colA, colB, colC = st.columns([1,1,1])
