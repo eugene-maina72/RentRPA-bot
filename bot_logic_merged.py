@@ -1,6 +1,6 @@
 
 # bot_logic_merged.py
-# Drop-in replacement for update_tenant_month_row that avoids full-sheet reads
+# This is a merged version of bot_logic.py with bugfixes.
 # and adds exponential backoff. Re-exports PATTERN, PAYMENT_COLS, parse_email.
 
 from datetime import datetime
