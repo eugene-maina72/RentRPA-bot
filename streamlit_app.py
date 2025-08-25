@@ -27,7 +27,7 @@ st.title("🏠 Rent RPA — Gmail → Google Sheets")
 # Persistent footer/help (always visible)
 st.markdown(
     """
-<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#f9fafb;margin-bottom:8px">
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#0000ff;margin-bottom:8px">
 <b>Tips:</b>
 • Paste a valid <i>Google Sheet</i> URL (not an .xlsx file). 
 • Use a targeted Gmail query to avoid quota issues. 
