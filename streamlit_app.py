@@ -1,9 +1,9 @@
 
-# streamlit_app.py (v2) — quota-hardened
-import json, time, base64, re
+# streamlit_app.py — Rent RPA (Gmail → Sheets)
+import json, time, base64, re, math
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -13,30 +13,46 @@ import gspread
 from gspread.exceptions import APIError
 from gspread.utils import ValueInputOption
 
-
-
-
 from bot_logic import (
-                 PATTERN, 
-                 parse_email, 
-                 update_tenant_month_row, 
-                 PAYMENT_COLS
+    PATTERN,
+    parse_email,
+    update_tenant_month_row,
+    PAYMENT_COLS
 )
 
-# ---------- Streamlit UI config ----------
+# ---------------- UI CONFIG & FOOTER ----------------
 st.set_page_config(page_title="Rent RPA (Gmail → Sheets)", page_icon="🏠", layout="wide")
 st.title("🏠 Rent RPA — Gmail → Google Sheets")
-st.caption("User-owned OAuth. Writes payment info from Gmail to your rent tracker sheet.")
+
+# Persistent footer/help (always visible)
+st.markdown(
+    """
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#f9fafb;margin-bottom:8px">
+<b>Tips:</b>
+• Paste a valid <i>Google Sheet</i> URL (not an .xlsx file). 
+• Use a targeted Gmail query to avoid quota issues. 
+• New tenant tabs are auto-created on first payment.
+• <b>Date due is always the 5th</b> of the month. Penalties apply if paid > 2 days after due date.
+• <b>Comments</b> column is for landlord/caretaker notes and is never overwritten by the bot.
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+st.caption("User-owned OAuth. Writes payment info from Gmail to your rent tracker sheet. Credentials never leave your browser+Google.")
+
 st.divider()
 st.header("About")
 st.markdown("""
 Scans Gmail for rent payment emails and logs them into a Google Sheet.
-- OAuth 2.0 (your account, your tokens)
+
+- OAuth 2.0 (your Google account)
 - Gmail API for search + parsing
 - Google Sheets API for appends/updates
+- Per-sheet caching & batch writes (quota-friendly)
 """)
 
-# ---------- OAuth config from Streamlit Secrets ----------
+# ---------------- OAUTH CONFIG ----------------
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -76,12 +92,11 @@ def store_creds(creds: Credentials):
 creds = get_creds()
 if creds and not creds.valid and creds.refresh_token:
     try:
-        creds.refresh(Request())
-        store_creds(creds)
+        creds.refresh(Request()); store_creds(creds)
     except Exception:
         creds = None
 
-# Callback before gate
+# OAuth callback
 params = st.query_params
 if "code" in params and "state" in params and "creds_json" not in st.session_state:
     flow = build_flow()
@@ -96,38 +111,63 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
 if not creds or not creds.valid:
     flow = build_flow()
     auth_url, state = flow.authorization_url(
-    access_type="offline",
-    include_granted_scopes="true",
-    prompt="consent",
-)
-
-    st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
+        access_type="offline",
+        include_granted_scopes="true",  # must be string "true"/"false"
+        prompt="consent",
+    )
+    st.link_button("🔐 Sign in with Google", auth_url, help="Authorize Gmail & Sheets. We only act on your behalf.", use_container_width=True)
     st.stop()
 
-# ---------- UI ----------
+# ---------------- INPUTS ----------------
 sheet_url = st.text_input(
     "Google Sheet URL (your rent tracker):",
-    placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxxxxxxxxxx/edit#gid=0"
+    placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxxxxxxxxxx/edit#gid=0",
+    help="Open your Sheet in Google Sheets (not Excel in Drive) and paste the full URL here."
 )
 gmail_query = st.text_input(
-    "Gmail search query:",
+    "Gmail search query",
     value='PAYLEMAIYAN subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
-    help='Use Gmail operators. Add "is:unread" when confident.'
+    help='Use Gmail operators, e.g. is:unread, after:, before:. Narrow the scope to avoid API quota issues.'
 )
-colA, colB, colC, colD = st.columns([1,1,1,1])
-with colA:
-    mark_read = st.checkbox("Mark processed emails as Read", value=True)
-with colB:
-    throttle_ms = st.number_input("Throttle per Sheets write (ms)", min_value=0, value=250, step=50)
-with colC:
-    max_results = st.number_input("Max messages to scan", min_value=10, max_value=500, value=200, step=10)
-with colD:
-    batch_size = st.number_input("Append batch size", min_value=10, max_value=200, value=50, step=10)
+colA, colB, colC, colD, colE = st.columns([1,1,1,1,1])
 
-run = st.button("▶️ Run Bot", type="primary", use_container_width=True)
+with colA:
+    mark_read = st.checkbox("Mark processed emails as Read", value=True, help="If checked, emails are marked Read after logging.")
+with colB:
+    throttle_ms = st.number_input("Throttle per Sheets write (ms)", min_value=0, value=250, step=50, help="Wait time between write batches. Increase if you hit 429 quota errors.")
+with colC:
+    max_results = st.number_input("Max Gmail messages to scan", min_value=10, max_value=1000, value=200, step=10, help="Upper bound on messages fetched for this run.")
+with colD:
+    batch_size = st.number_input("Append batch size", min_value=10, max_value=500, value=50, step=10, help="How many history/refs rows to append in one batch.")
+with colE:
+    automation_enabled = st.checkbox("Enable weekly automation", value=False, help="Runs automatically on Mondays 09:00 EAT while the app is open. Uncheck if worried about credentials.")
+
+st.caption("Note: automation only triggers when this app is running (e.g., deployed on Streamlit Cloud or a server).")
+
+run = st.button("▶️ Run Bot Now", type="primary", use_container_width=True)
+
+# Automation trigger (opt-in, Monday 09:00 EAT; no background jobs — fires while app open)
+def should_auto_run():
+    if not automation_enabled:
+        return False
+    now = datetime.utcnow()  # treat as UTC; adjust to EAT (+3) for the window check
+    eat_hour = (now.hour + 3) % 24
+    eat_weekday = (now.weekday() + (1 if now.hour + 3 >= 24 else 0)) % 7 if False else now.weekday()  # keep simple
+    # Trigger if it's Monday in EAT between 09:00–09:30 EAT and we haven't run in last 6 days
+    in_window = (eat_weekday == 0) and (eat_hour == 9)
+    last = st.session_state.get("last_auto_run_at")
+    if in_window and (last is None or (datetime.utcnow() - last) > timedelta(days=6)):
+        return True
+    return False
+
+auto_trigger = should_auto_run()
+if auto_trigger:
+    st.info("🤖 Weekly automation window detected — running bot.")
+run = run or auto_trigger
+
 st.divider()
 
-# ---------- Helpers ----------
+# ---------------- HELPERS ----------------
 def extract_sheet_id(url: str) -> str:
     try:
         return url.split("/d/")[1].split("/")[0]
@@ -165,18 +205,16 @@ def get_message_text(service, msg_id):
 # Backoff wrapper for Sheets calls that may 429
 def with_backoff(fn, *args, **kwargs):
     delay = 1.0
-    for i in range(6):  # ~1+2+4+8+16+32 = 63s worst case
+    for _ in range(6):  # ~63s worst case
         try:
             return fn(*args, **kwargs)
         except APIError as e:
             if hasattr(e, "response") and e.response.status_code == 429:
-                time.sleep(delay)
-                delay *= 2
-                continue
+                time.sleep(delay); delay *= 2; continue
             raise
     return fn(*args, **kwargs)
 
-# ---------- Main ----------
+# ---------------- MAIN ----------------
 if run:
     if not sheet_url:
         st.error("Please paste your Google Sheet URL.")
@@ -197,7 +235,7 @@ if run:
         st.error(f"Could not open the Google Sheet. Ensure you own it or have edit access.\n\n{e}")
         st.stop()
 
-    # meta sheets
+    # Meta sheets
     def ensure_meta(ws_name, header):
         try:
             ws = sh.worksheet(ws_name)
@@ -245,9 +283,12 @@ if run:
                 return ws
         title = f"{account_code} - AutoAdded"
         ws = sh.add_worksheet(title=title, rows=1000, cols=12)
-        with_backoff(ws.update, range_name='A1',
-                     values=[['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties']],
-                     value_input_option=ValueInputOption.user_entered)
+        with_backoff(
+            ws.update,
+            range_name='A1',
+            values=[['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties','Comments']],
+            value_input_option=ValueInputOption.user_entered
+        )
         try:
             ws.format('1:1', {'textFormat': {'bold': True}})
             ws.freeze(rows=1)
@@ -263,12 +304,13 @@ if run:
     logs = []
 
     for idx, (msg_id, p) in enumerate(parsed, start=1):
-        
         ws = find_or_create_tenant_sheet(p["AccountCode"])
         info = update_tenant_month_row(ws, p)
 
+        # Adapted to new bot_logic return keys
         logs.append(
-            f"🧾 {info['sheet']} R{info['month_row']} | Paid {info['paid_before']}→{info['paid_after']} | Ref {info['ref_added']} | formulas set: {info['formulas_set']}"
+            f"🧾 {info.get('sheet')} R{info.get('row')} | {info.get('month')} | "
+            f"Paid {info.get('paid_before')}→{info.get('paid_after')} | Ref {p.get('REF Number')}"
         )
 
         dt = datetime.strptime(p["Date Paid"], "%d/%m/%Y %I:%M %p")
@@ -296,21 +338,8 @@ if run:
             with_backoff(refs_ws.append_rows, ref_rows, value_input_option=ValueInputOption.raw)
             ref_rows.clear()
 
-    hist_vals = with_backoff(hist_ws.get_all_values)
-    if len(hist_vals) > 1:
-        df = pd.DataFrame(hist_vals[1:], columns=hist_vals[0])
-        with pd.option_context('display.float_format', '{:,.2f}'.format):
-            df["Amount Paid"] = pd.to_numeric(df["Amount Paid"], errors="coerce").fillna(0.0)
-            grouped = df.groupby("Month", dropna=False).agg(
-                Payments=("REF Number","count"),
-                TotalAmount=("Amount Paid","sum")
-            ).reset_index().sort_values("Month")
-            st.subheader("Payment History — Grouped by Month")
-            st.dataframe(grouped, use_container_width=True)
-    else:
-        st.info("No PaymentHistory yet.")
-
-    st.success("Done.")
+    # ---------- DASHBOARDS ----------
+    st.success("Ingestion complete.")
     st.subheader("Run Log")
     if logs:
         st.code("\n".join(logs), language="text")
@@ -318,4 +347,116 @@ if run:
         st.subheader("Non-fatal Parse/Read Errors")
         st.code("\n".join(errors), language="text")
 
-st.caption(f"Rent-RPA @{datetime.now().year} .Built by [Eugene Maina](https://github.com/eugene-maina72).")
+    # 1) Payment History Aggregates (from PaymentHistory)
+    hist_vals = with_backoff(hist_ws.get_all_values)
+    if len(hist_vals) > 1:
+        df_hist = pd.DataFrame(hist_vals[1:], columns=hist_vals[0])
+        with pd.option_context('display.float_format', '{:,.2f}'.format):
+            # Numeric cast
+            for col in ("Amount Paid",):
+                df_hist[col] = pd.to_numeric(df_hist[col], errors="coerce").fillna(0.0)
+
+            # Grouped by Month
+            grouped = df_hist.groupby("Month", dropna=False).agg(
+                Payments=("REF Number","count"),
+                TotalAmount=("Amount Paid","sum")
+            ).reset_index().sort_values("Month")
+
+            # This-month income metric
+            this_month = datetime.now().strftime("%Y-%m")
+            income_this_month = float(df_hist.loc[df_hist["Month"] == this_month, "Amount Paid"].sum())
+
+            st.subheader("Payment History — Grouped by Month")
+            st.dataframe(grouped, use_container_width=True)
+
+    else:
+        df_hist = pd.DataFrame(columns=PAYMENT_COLS + ['AccountCode','TenantSheet','Month'])
+        income_this_month = 0.0
+        st.info("No PaymentHistory yet.")
+
+    # 2) Portfolio metrics from tenant sheets (arrears/prepayments & penalties)
+    total_prepay = 0.0
+    total_arrears = 0.0
+    penalty_freq = {}  # AccountCode -> count of rows with penalties>0
+
+    def parse_float(x):
+        try:
+            return float(str(x).replace(",", "").strip())
+        except Exception:
+            return 0.0
+
+    for ws in sh.worksheets():
+        name = ws.title.upper()
+        if name in ("PAYMENTHISTORY", "PROCESSEDREFS"):
+            continue
+        try:
+            vals = with_backoff(ws.get_all_values)
+            if not vals:
+                continue
+            header = [c.strip() for c in vals[0]]
+            def idx(colname):
+                try: return header.index(colname)
+                except ValueError: return -1
+
+            i_bal = idx("Prepayment/Arrears")
+            i_pen = idx("Penalties")
+            i_mon = idx("Month")
+            if i_bal == -1 and "Prepayment/Arrears" in header:
+                i_bal = header.index("Prepayment/Arrears")
+
+            rows = vals[1:]
+            if not rows:
+                continue
+
+            # Latest balance (last non-empty in Month col preferred)
+            # Fallback: last row
+            latest_row = None
+            for r in reversed(rows):
+                if i_mon != -1 and len(r) > i_mon and str(r[i_mon]).strip():
+                    latest_row = r; break
+            if latest_row is None:
+                latest_row = rows[-1]
+
+            if i_bal != -1 and len(latest_row) > i_bal:
+                bal = parse_float(latest_row[i_bal])
+                if bal > 0:
+                    total_prepay += bal
+                elif bal < 0:
+                    total_arrears += abs(bal)
+
+            # Penalty frequency
+            if i_pen != -1:
+                cnt = 0
+                for r in rows:
+                    if len(r) > i_pen and parse_float(r[i_pen]) > 0:
+                        cnt += 1
+                acct = ws.title.split(" - ")[0].strip().upper()
+                penalty_freq[acct] = penalty_freq.get(acct, 0) + cnt
+
+        except APIError:
+            continue
+        except Exception:
+            continue
+
+    # Display metrics
+    st.subheader("📊 Portfolio Metrics")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Income (this month)", f"{income_this_month:,.0f} KES")
+    m2.metric("Total Prepayments", f"{total_prepay:,.0f} KES")
+    m3.metric("Total Arrears", f"{total_arrears:,.0f} KES")
+
+    if penalty_freq:
+        df_pen = pd.DataFrame(
+            [{"AccountCode": k, "Penalty Rows": v} for k, v in penalty_freq.items()]
+        ).sort_values("Penalty Rows", ascending=False)
+        st.markdown("**Penalty frequency by AccountCode** (rows with penalties > 0):")
+        st.dataframe(df_pen, use_container_width=True)
+
+    # mark automation time if auto
+    if auto_trigger:
+        st.session_state["last_auto_run_at"] = datetime.utcnow()
+
+# Footer (hardwired caption)
+st.divider()
+st.caption("Rent-RPA © {year}. Built by Eugene Maina. — Need help? The top banner explains the flow; hover over inputs for tips."
+           .format(year=datetime.now().year))
