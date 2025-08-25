@@ -13,7 +13,10 @@ import gspread
 from gspread.exceptions import APIError
 from gspread.utils import ValueInputOption
 
-from bot_logic_merged import (
+
+
+
+from bot_logic import (
                  PATTERN, 
                  parse_email, 
                  update_tenant_month_row, 
@@ -93,10 +96,11 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
 if not creds or not creds.valid:
     flow = build_flow()
     auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",  # must be string per Google API
-        prompt="consent",
-    )
+    access_type="offline",
+    include_granted_scopes="true",
+    prompt="consent",
+)
+
     st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
     st.stop()
 
@@ -259,6 +263,7 @@ if run:
     logs = []
 
     for idx, (msg_id, p) in enumerate(parsed, start=1):
+        
         ws = find_or_create_tenant_sheet(p["AccountCode"])
         info = update_tenant_month_row(ws, p)
 
@@ -312,3 +317,5 @@ if run:
     if errors:
         st.subheader("Non-fatal Parse/Read Errors")
         st.code("\n".join(errors), language="text")
+
+st.caption(f"Rent-RPA @{datetime.now().year} .Built by [Eugene Maina](https://github.com/eugene-maina72).")

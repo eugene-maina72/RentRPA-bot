@@ -1,16 +1,34 @@
+
+# -*- coding: utf-8 -*-
+"""
+bot_logic.py — quota-friendly, production-hardened updater for RentRAP
+
+Features:
+- Canonical headers only (drops junk like "Column 1/2/3…" and unknown headers)
+- Adds missing canonical columns (including "Comments")
+- Carry-forward "Amount Due" (if user changes rent in the sheet, that becomes baseline going forward)
+- "Date due" always = 5th of the month (value, not a formula)
+- Robust "Penalties" & "Prepayment/Arrears" formulas (work with text or true date cells)
+- Conditional formatting: arrears<0 (light red), penalties>0 (light yellow)
+- Quota-friendly: one get_all_values per sheet per run; in-memory cache; batch writes
+"""
+
+from __future__ import annotations
 import re
 import time
-from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
 from googleapiclient.errors import HttpError
 from gspread.utils import rowcol_to_a1
-from dateutil.relativedelta import relativedelta
 
-# ------------------- Parsing -------------------
+# =========================
+# Parsing (M-Pesa emails)
+# =========================
+
 MAX_PHONE_LEN = 13
 REF_LEN = 10
 
-# Optional '#' before account code; 10-char alphanumeric ref
 PATTERN = re.compile(
     rf'payment of KES ([\d,]+\.\d{{2}}) '
     rf'for account: PAYLEMAIYAN\s*#?\s*([A-Za-z]\d{{1,2}})'
@@ -21,11 +39,10 @@ PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 
-# Unified event schema (aligns app + notebook)
 PAYMENT_COLS = ['Date Paid','Amount Paid','REF Number','Payer','Phone','Payment Mode']
 
 def parse_email(text: str):
-    """Return dict in PAYMENT_COLS + AccountCode or None if no match."""
+    """Parse raw email text into a structured payment dict. Returns None if no match."""
     m = PATTERN.search(text or "")
     if not m:
         return None
@@ -40,217 +57,432 @@ def parse_email(text: str):
         'AccountCode': code.upper(),
     }
 
-# ------------------- Tenant sheet updater (realtime formulas) -------------------
-_PUNCT = re.compile(r"[^\w\s/]+", re.UNICODE)
-def _norm(s):
-    if s is None: return ""
-    s = str(s).replace("\xa0", " ")
-    s = s.strip().lower()
-    s = _PUNCT.sub("", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
+# =========================
+# Header + schema helpers
+# =========================
 
 ALIASES = {
     "month": {"month","month/period","period","rent month","billing month"},
-    "amount_due": {"amount due","rent due","due","amountdue","monthly rent","rent","amount due kes","rent kes"},
+    "amount_due": {"amount due","rent due","due","monthly rent","rent","amount due kes","rent kes"},
     "amount_paid": {"amount paid","paid","amt paid","paid kes","amountpaid"},
     "date_paid": {"date paid","paid date","payment date","datepaid"},
     "ref": {"ref number","ref","reference","ref no","reference no","mpesa ref","mpesa reference","receipt","receipt no"},
     "date_due": {"date due","due date","rent due date","datedue"},
     "prepay_arrears": {"prepayment/arrears","prepayment","arrears","balance","bal","prepayment arrears","carry forward","cf"},
     "penalties": {"penalties","penalty","late fee","late fees","fine","fines"},
+    "comments": {"comments","comment","remarks","notes","note"},
 }
-REQUIRED_KEYS = ["month","amount_due","amount_paid","date_paid","ref","date_due","prepay_arrears","penalties"]
 
-def _header_map_from_row(row):
-    row_norm = [_norm(c) for c in row]
-    colmap = {}
-    for key, aliases in ALIASES.items():
-        for i, token in enumerate(row_norm):
-            if token in aliases:
-                colmap[key] = i
-                break
-    return colmap
+REQUIRED_KEYS = ["month","amount_due","amount_paid","date_paid","ref","date_due","prepay_arrears","penalties","comments"]
+CANONICAL_NAME = {
+    "month": "Month",
+    "amount_due": "Amount Due",
+    "amount_paid": "Amount paid",
+    "date_paid": "Date paid",
+    "ref": "REF Number",
+    "date_due": "Date due",
+    "prepay_arrears": "Prepayment/Arrears",
+    "penalties": "Penalties",
+    "comments": "Comments",
+}
+CANONICAL_SET = {CANONICAL_NAME[k] for k in REQUIRED_KEYS}
 
-def _detect_or_create_header(ws):
-    """Probe A1:T10 for a header. If none matches (>=4), insert canonical header at row 1."""
-    end_a1 = rowcol_to_a1(10, 20)  # T10
-    try:
-        window = ws.get(f"A1:{end_a1}")
-    except Exception:
-        window = []
+def _norm_header(s: str) -> str:
+    """Normalize header text (lowercase, strip punctuation/extra spaces)."""
+    s = str(s or "").replace("\xa0", " ").strip().lower()
+    s = re.sub(r"[^\w\s/]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    best_idx, best_map, best_hits = None, None, -1
-    for idx, row in enumerate(window):
-        cmap = _header_map_from_row(row)
-        hits = len(cmap)
-        if hits > best_hits:
-            best_idx, best_map, best_hits = idx, cmap, hits
-
-    if best_hits >= 4 and best_idx is not None:
-        header = ws.row_values(best_idx+1)
-        if best_map is not None and "penalties" not in best_map:
-            header = header + ["Penalties"]
-            ws.update(values=[header], range_name=f"{best_idx+1}:{best_idx+1}", value_input_option="USER_ENTERED")
-            best_map = _header_map_from_row(header)
-        return best_idx, header, best_map
-
-    header = ['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties']
-    ws.insert_rows([header], row=1)
-    return 0, header, _header_map_from_row(header)
-
-def _month_key_from_date_str(date_str):
-    dt = datetime.strptime(date_str, '%d/%m/%Y %I:%M %p')
-    return dt.strftime('%b-%Y'), dt
-
-def _find_month_row(values, month_col_idx, month_key):
-    for r in range(1, len(values)):  # skip header row 0
-        cell = str(values[r][month_col_idx]).strip()
-        if not cell:
-            continue
-        if cell.lower().startswith(month_key.lower()[:3]) and month_key[-4:] in cell:
-            return r
-    return None
-
-def _col_letter(row, col):
-    return re.sub(r'\d+', '', rowcol_to_a1(row, col))
-
-def update_tenant_month_row(tenant_ws, payment: Dict) -> Dict:
-    """
-    Realtime variant:
-      - Writes ONLY: Amount paid, Date paid, REF Number
-      - Sets formulas for: Prepayment/Arrears = N(Amount paid) - N(Amount Due)
-                           Penalties = IF(AND(N(Paid)<N(Due), DATEVALUE(LEFT(DatePaid,10))>DATEVALUE(DateDue)+6), 3000, 0)
-    Returns details for logging; does NOT read formula results (quota-safe).
-    """
-    header_row0, header, colmap = _detect_or_create_header(tenant_ws)
-    if not colmap:
-        raise ValueError(f"Sheet '{tenant_ws.title}' header mapping failed (colmap is None).")
-    missing = [k for k in REQUIRED_KEYS if k not in colmap]
-    if missing:
-        raise ValueError(f"Sheet '{tenant_ws.title}' missing required columns after normalization: {missing}")
-
-    all_vals = tenant_ws.get_all_values()
-    vals = all_vals[header_row0:]
-    base_row_1based = header_row0 + 1
-
-    month_key, _pay_dt = _month_key_from_date_str(payment['Date Paid'])
-    row_rel = _find_month_row(vals, colmap['month'], month_key)
-    if row_rel is None:
-        new_row = [''] * len(header)
-        new_row[colmap['month']] = month_key
-        new_row[colmap['amount_due']] = '0'
-        new_row[colmap['amount_paid']] = '0'
-        new_row[colmap['date_paid']] = ''
-        new_row[colmap['ref']] = ''
-        new_row[colmap['date_due']] = ''
-        new_row[colmap['prepay_arrears']] = '0'
-        new_row[colmap['penalties']] = '0'
-
-        # Set Date due as the previous row's date due plus one month.
-        # Try to get last row's Date due (skip header row)
-        if len(vals) > 1 and vals[-1][colmap['date_due']]:
-            try:
-                last_date_due = datetime.strptime(vals[-1][colmap['date_due']], "%d/%m/%Y").replace(day=5)
-                new_date_due = last_date_due + relativedelta(months=1)
-            except Exception:
-                # Fallback to payment date plus one month if parsing fails
-                new_date_due = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p') + relativedelta(months=1)
-            new_row[colmap['date_due']] = new_date_due.strftime("%d/%m/%Y")
-        else:
-            new_date_due = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p') + relativedelta(months=1)
-            new_row[colmap['date_due']] = new_date_due.strftime("%d/%m/%Y")
-            
-        # prepay/arrears and penalties will be set as FORMULAS after append
-        tenant_ws.append_row(new_row, value_input_option='USER_ENTERED')
-        all_vals = tenant_ws.get_all_values()
-        vals = all_vals[header_row0:]
-        row_rel = len(vals) - 1
-
-    if row_rel is None or row_rel < 0 or row_rel >= len(vals):
-        raise ValueError("Failed to find or create a valid month row in the tenant sheet.")
-
-    row_abs_1based = base_row_1based + row_rel
-    row = vals[row_rel]
-    def _num(v):
+def _with_backoff(fn, *args, **kwargs):
+    """Retry wrapper for Sheets API calls (handles 429 throttling)."""
+    delay = 1.0
+    for _ in range(6):
         try:
-            s = str(v).replace(',','').strip()
-            return float(s) if s else 0.0
-        except:
-            return 0.0
-    def _str(v):
-        return '' if v is None else str(v)
-
-    paid0 = _num(row[colmap['amount_paid']])
-    ref0  = _str(row[colmap['ref']])
-    paid1 = paid0 + float(payment['Amount Paid'])
-
-    # Write only the 3 direct fields (compact range write)
-    updates = {
-        colmap['amount_paid']:  paid1,
-        colmap['date_paid']:    payment['Date Paid'],
-        colmap['ref']:          (payment['REF Number'] if not ref0 else f"{ref0}, {payment['REF Number']}")
-    }
-    touched = sorted(updates.keys())
-    c1 = touched[0] + 1
-    c2 = touched[-1] + 1
-    rng = f"{rowcol_to_a1(row_abs_1based, c1)}:{rowcol_to_a1(row_abs_1based, c2)}"
-    payload = [''] * (c2 - c1 + 1)
-    for cidx, val in updates.items():
-        payload[(cidx + 1 - c1)] = val
-    payload = [str(x) if x is not None else '' for x in payload]
-
-    for attempt in range(5):
-        try:
-            tenant_ws.update(values=[payload], range_name=rng, value_input_option='USER_ENTERED')
-            break
-        except HttpError as e:
-            if getattr(e, "resp", None) and e.resp.status == 429:
-                time.sleep(5 * (attempt+1))
-                continue
+            return fn(*args, **kwargs)
+        except Exception as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status == 429 or "quota" in str(e).lower():
+                time.sleep(delay); delay *= 2; continue
             raise
 
-    # Ensure formulas exist (set once; then realtime recalcs)
-    col_letters = {k: _col_letter(row_abs_1based, colmap[k] + 1) for k in colmap}
-    amt_paid_addr = f"{col_letters['amount_paid']}{row_abs_1based}"
-    amt_due_addr  = f"{col_letters['amount_due']}{row_abs_1based}"
-    date_paid_addr= f"{col_letters['date_paid']}{row_abs_1based}"
-    date_due_addr = f"{col_letters['date_due']}{row_abs_1based}"
-    bal_addr      = f"{col_letters['prepay_arrears']}{row_abs_1based}"
-    pen_addr      = f"{col_letters['penalties']}{row_abs_1based}"
+def _alias_key_for(normalized_header: str) -> Optional[str]:
+    """Return the canonical key if header matches an alias, else None."""
+    for key, aliases in ALIASES.items():
+        if normalized_header in aliases:
+            return key
+    return None
 
-    
-    # Penalties formula: if DatePaid > DateDue + 2 days, penalty = 3000
-    pen_formula = f"=IF(DATEVALUE(LEFT({date_paid_addr},10))>DATEVALUE({date_due_addr})+2, 3000, 0)"
+def _header_colmap(header: List[str]) -> Dict[str, int]:
+    """Map canonical keys → column index for a given header row."""
+    colmap: Dict[str,int] = {}
+    seen_keys = set()
+    for idx, name in enumerate(header):
+        name_str = str(name or "")
+        norm = _norm_header(name_str)
+        if name_str in CANONICAL_SET:
+            key = next(k for k, v in CANONICAL_NAME.items() if v == name_str)
+        else:
+            key = _alias_key_for(norm)
+        if key and key not in seen_keys:
+            colmap[key] = idx
+            seen_keys.add(key)
+    return colmap
 
-    # Balance formula: if first data row, =N(amt_paid)-N(amt_due); else, =N(prev_bal)+N(amt_paid)-N(amt_due)
-    if row_abs_1based == base_row_1based:
+# =========================
+# Month parsing / formatting
+# =========================
+
+def _parse_month_cell(s: str) -> Optional[Tuple[int,int]]:
+    """Parse Month like 'Aug-2025', 'August 2025', '2025-08', '08/2025' → (year, month)."""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.match(r"^([A-Za-z]{3,9})[- ](\d{4})$", s)
+    if m:
+        name, year = m.group(1), int(m.group(2))
+        for fmt in ("%b", "%B"):
+            try:
+                dt = datetime.strptime(f"01 {name} {year}", f"%d {fmt} %Y")
+                return (dt.year, dt.month)
+            except ValueError:
+                pass
+    m = re.match(r"^(\d{4})[-/](\d{1,2})$", s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^(\d{1,2})[-/](\d{4})$", s)
+    if m:
+        return (int(m.group(2)), int(m.group(1)))
+    return None
+
+def _choose_month_display(existing_month_samples: List[str], dt: datetime) -> str:
+    """Emit Month string in an existing style if we find one, else 'Mon-YYYY'."""
+    for v in existing_month_samples:
+        t = (v or "").strip()
+        if not t:
+            continue
+        if re.fullmatch(r"\d{4}[-/]\d{1,2}", t):
+            delim = '-' if '-' in t else '/'
+            return f"{dt.year}{delim}{dt.month:02d}"
+        if re.fullmatch(r"[A-Za-z]{3,9}[- ]\d{4}", t):
+            delim = '-' if '-' in t else ' '
+            token = t.split(delim)[0]
+            fmt = '%b' if len(token) == 3 else '%B'
+            return f"{dt.strftime(fmt)}{delim}{dt.year}"
+        if re.fullmatch(r"\d{1,2}[-/]\d{4}", t):
+            delim = '-' if '-' in t else '/'
+            return f"{dt.month:02d}{delim}{dt.year}"
+    return dt.strftime("%b-%Y")
+
+# =========================
+# Conditional formatting
+# =========================
+
+def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], cache: Dict):
+    """Add CF rules for arrears (<0) and penalties (>0). Guard with cache flag to avoid duplicates within a run."""
+    if cache.get("cf_applied"):
+        return
+    try:
+        sheet_id = ws.id
+    except Exception:
+        return
+    start_row = header_row0 + 1  # 0-based index for first data row
+
+    requests = [
+        {   # Arrears < 0 (Prepayment/Arrears column)
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_row,
+                        "startColumnIndex": colmap["prepay_arrears"],
+                        "endColumnIndex": colmap["prepay_arrears"] + 1
+                    }],
+                    "booleanRule": {
+                        "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+                        "format": {"backgroundColor": {"red": 1.0, "green": 0.84, "blue": 0.84}}
+                    }
+                },
+                "index": 0
+            }
+        },
+        {   # Penalties > 0 (Penalties column)
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_row,
+                        "startColumnIndex": colmap["penalties"],
+                        "endColumnIndex": colmap["penalties"] + 1
+                    }],
+                    "booleanRule": {
+                        "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+                        "format": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.6}}
+                    }
+                },
+                "index": 1
+            }
+        },
+    ]
+    try:
+        ws.spreadsheet.batch_update({"requests": requests})
+        cache["cf_applied"] = True
+    except Exception:
+        pass
+
+# =========================
+# Header canonicalization
+# =========================
+
+def _canonicalize_header_and_rows(ws, header: List[str], rows: List[List[str]]) -> Tuple[List[str], List[List[str]], Dict[str,int], bool]:
+    """
+    - Normalize header labels to canonical names for any recognized alias.
+    - Keep only canonical/aliased columns (drop “Column N” and any unknown headers) — deletes columns in the sheet.
+    - Append any missing canonical columns at the end (adds cols in the sheet).
+    - If 'Comments' is newly added, prefill 'None' for all existing rows.
+    - Return (new_header, new_rows, colmap, comments_added_now).
+    """
+    comments_added_now = False
+
+    # 1) Identify unknown/duplicate columns to delete from the actual sheet
+    to_delete = []
+    keep_mask = []
+    seen_keys = set()
+    for idx, name in enumerate(header):
+        name_str = str(name or "")
+        norm = _norm_header(name_str)
+        key = None
+        if name_str in CANONICAL_SET:
+            key = next(k for k, v in CANONICAL_NAME.items() if v == name_str)
+        else:
+            key = _alias_key_for(norm)
+        if key and key not in seen_keys:
+            keep_mask.append(True)
+            seen_keys.add(key)
+        else:
+            # delete "Column N" or unknowns/duplicates
+            if re.fullmatch(r"(?i)column\s+\d+", name_str) or key is None or key in seen_keys:
+                to_delete.append(idx)
+                keep_mask.append(False)
+            else:
+                keep_mask.append(True)
+
+    # Physically delete columns on the sheet (right->left)
+    if to_delete:
+        try:
+            sheet_id = ws.id
+            requests = []
+            for idx in sorted(to_delete, reverse=True):
+                requests.append({
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": idx,
+                            "endIndex": idx+1
+                        }
+                    }
+                })
+            ws.spreadsheet.batch_update({"requests": requests})
+        except Exception:
+            pass
+
+    # Apply deletions in-memory
+    for idx in sorted(to_delete, reverse=True):
+        del header[idx]
+        for r in rows:
+            if idx < len(r):
+                del r[idx]
+
+    # 2) Rename kept columns to canonical names
+    for i, name in enumerate(header):
+        norm = _norm_header(name)
+        if name in CANONICAL_SET:
+            continue
+        key = _alias_key_for(norm)
+        if key:
+            header[i] = CANONICAL_NAME[key]
+
+    # 3) Append any missing canonical columns (also ensure grid has enough cols)
+    present = set(header)
+    for key in REQUIRED_KEYS:
+        canon = CANONICAL_NAME[key]
+        if canon not in present:
+            header.append(canon)
+            for r in rows:
+                r.append("None" if key == "comments" else "")
+            present.add(canon)
+            if key == "comments":
+                comments_added_now = True
+    try:
+        if ws.col_count < len(header):
+            ws.add_cols(len(header) - ws.col_count)
+    except Exception:
+        pass
+
+    # 4) Rebuild colmap
+    colmap = _header_colmap(header)
+    return header, rows, colmap, comments_added_now
+
+# =========================
+# Cache
+# =========================
+
+_sheet_cache: Dict[str, Dict] = {}
+
+def clear_cache():
+    """Clear in-memory sheet cache."""
+    _sheet_cache.clear()
+
+# =========================
+# Main updater
+# =========================
+
+def update_tenant_month_row(ws, payment: Dict) -> Dict:
+    """
+    Update a tenant worksheet for a payment dict.
+
+    Fast path by design:
+      - One read of entire sheet (first time per sheet per run).
+      - In-memory scan/mutate of cached rows.
+      - One batch write to push values + formulas.
+      - One-time conditional formatting apply per sheet per run.
+    """
+    title = ws.title
+    header_row0 = 0  # header at row 1
+
+    # 0) Prime cache: read everything once
+    if title not in _sheet_cache:
+        all_vals = _with_backoff(ws.get_all_values)  # ONE READ
+        header = list(all_vals[0]) if all_vals else []
+        rows   = [list(r) for r in all_vals[1:]] if len(all_vals) > 1 else []
+
+        # Canonicalize header + rows (in memory, and delete junk columns in sheet)
+        header, rows, colmap, comments_added_now = _canonicalize_header_and_rows(ws, header, rows)
+
+        # Write back normalized header (single row update)
+        _with_backoff(ws.update, "1:1", [header])
+
+        # If we just added Comments, prefill "None" for all existing rows (single column update)
+        if comments_added_now and rows:
+            comments_col_1based = colmap["comments"] + 1
+            start_addr = rowcol_to_a1(header_row0 + 2, comments_col_1based)             # e.g., H2
+            end_addr   = rowcol_to_a1(header_row0 + 1 + len(rows), comments_col_1based) # e.g., H{last}
+            rng = f"{start_addr}:{end_addr}"
+            _with_backoff(ws.update, rng, [[ "None" ] for _ in rows], value_input_option="USER_ENTERED")
+
+        # Cache sheet state
+        _sheet_cache[title] = {
+            "header_row0": header_row0,
+            "header": header,
+            "rows": rows,
+            "colmap": colmap,
+            "cf_applied": False,
+        }
+
+    header = _sheet_cache[title]["header"]
+    rows   = _sheet_cache[title]["rows"]
+    colmap = _sheet_cache[title]["colmap"]
+    header_row0 = _sheet_cache[title]["header_row0"]
+
+    # 1) Date calculations
+    dt_paid = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p')
+    target_y, target_m = dt_paid.year, dt_paid.month
+    existing_month_samples = [r[colmap['month']] for r in rows if len(r) > colmap['month'] and r[colmap['month']]]
+    month_display = _choose_month_display(existing_month_samples, dt_paid)
+
+    # 2) Find existing month row (compare parsed (year,month))
+    row_abs = None
+    for i, r in enumerate(rows, start=2):  # row 1 is header
+        if len(r) <= colmap['month']:
+            continue
+        ym = _parse_month_cell(r[colmap['month']])
+        if ym and ym == (target_y, target_m):
+            row_abs = i
+            break
+
+    # 3) If not found, append new row with carried-forward Amount Due (rent) and default Comments
+    if row_abs is None:
+        last_due = "0"
+        for r in reversed(rows):
+            if len(r) > colmap['amount_due'] and str(r[colmap['amount_due']]).strip():
+                last_due = r[colmap['amount_due']]
+                break
+        new_row = [""] * len(header)
+        new_row[colmap['month']] = month_display
+        new_row[colmap['amount_due']] = last_due
+        new_row[colmap['comments']] = "None"  # default so landlord/caretaker can later replace
+        rows.append(new_row)
+        _with_backoff(ws.append_row, new_row, value_input_option='USER_ENTERED')
+        row_abs = len(rows) + 1  # account for header row
+
+    # 4) Mutate the cached row in memory (do not overwrite existing Comments)
+    row_idx = row_abs - 2
+    while len(rows[row_idx]) < len(header):
+        rows[row_idx].append("")
+
+    def _num(v):
+        try:
+            return float(str(v).replace(",", "").strip() or 0)
+        except Exception:
+            return 0.0
+
+    paid_before = _num(rows[row_idx][colmap['amount_paid']])
+    paid_after  = paid_before + float(payment['Amount Paid'])
+    prev_ref    = rows[row_idx][colmap['ref']] or ""
+    ref_new     = payment['REF Number'] if not prev_ref else f"{prev_ref}, {payment['REF Number']}"
+    due_str     = datetime(target_y, target_m, 5).strftime("%d/%m/%Y")  # ALWAYS 5th
+
+    # Update in-memory row values (leave 'Comments' as-is if user added anything)
+    rows[row_idx][colmap['month']]       = month_display
+    rows[row_idx][colmap['amount_paid']] = str(paid_after)
+    rows[row_idx][colmap['date_paid']]   = payment['Date Paid']
+    rows[row_idx][colmap['ref']]         = ref_new
+    rows[row_idx][colmap['date_due']]    = due_str
+
+    # 5) Build robust formulas (text or serial dates both work)
+    amt_paid_addr  = rowcol_to_a1(row_abs, colmap['amount_paid']+1)
+    amt_due_addr   = rowcol_to_a1(row_abs, colmap['amount_due']+1)
+    date_paid_addr = rowcol_to_a1(row_abs, colmap['date_paid']+1)
+    date_due_addr  = rowcol_to_a1(row_abs, colmap['date_due']+1)
+    pen_addr       = rowcol_to_a1(row_abs, colmap['penalties']+1)
+    bal_addr       = rowcol_to_a1(row_abs, colmap['prepay_arrears']+1)
+    prev_bal_addr  = rowcol_to_a1(row_abs-1, colmap['prepay_arrears']+1)
+
+    # Penalty formula:
+    # =IF(AND(ISNUMBER(DatePaid), ISNUMBER(DateDue), DatePaid > DateDue + 2), 3000, 0)
+    # Coerces text/numeric dates:
+    dpaid_expr = f"IF(ISTEXT({date_paid_addr}), DATEVALUE(LEFT({date_paid_addr},10)), {date_paid_addr})"
+    ddue_expr  = f"IF(ISTEXT({date_due_addr}), DATEVALUE({date_due_addr}), {date_due_addr})"
+    pen_formula = f"=IF(AND(ISNUMBER({dpaid_expr}), ISNUMBER({ddue_expr}), {dpaid_expr}>{ddue_expr}+2),3000,0)"
+
+    # Rolling balance (Prepayment/Arrears)
+    if row_abs == header_row0 + 2:
         bal_formula = f"=N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
     else:
-        prev_bal_addr = f"{col_letters['prepay_arrears']}{row_abs_1based-1}"
         bal_formula = f"=N({prev_bal_addr})+N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
 
-    # Only set formula if not already a formula (avoid read spam in loop)
-    try:
-        cur_bal = tenant_ws.acell(bal_addr).value or ""
-        cur_pen = tenant_ws.acell(pen_addr).value or ""
-    except Exception:
-        cur_bal, cur_pen = "", ""
+    # 6) Single batch write for all changes
+    updates = [
+        {"range": rowcol_to_a1(row_abs, colmap['month']+1),         "values": [[month_display]]},
+        {"range": rowcol_to_a1(row_abs, colmap['amount_paid']+1),   "values": [[paid_after]]},
+        {"range": rowcol_to_a1(row_abs, colmap['date_paid']+1),     "values": [[payment['Date Paid']]]},
+        {"range": rowcol_to_a1(row_abs, colmap['ref']+1),           "values": [[ref_new]]},
+        {"range": rowcol_to_a1(row_abs, colmap['date_due']+1),      "values": [[due_str]]},
+        {"range": rowcol_to_a1(row_abs, colmap['penalties']+1),     "values": [[pen_formula]]},
+        {"range": rowcol_to_a1(row_abs, colmap['prepay_arrears']+1),"values": [[bal_formula]]},
+    ]
+    _with_backoff(ws.batch_update, updates, value_input_option='USER_ENTERED')
 
-    needs_bal = not str(cur_bal).startswith("=")
-    needs_pen = not str(cur_pen).startswith("=")
-
-    if needs_bal or needs_pen:
-        body = []
-        if needs_bal: body.append({'range': bal_addr, 'values': [[bal_formula]]})
-        if needs_pen: body.append({'range': pen_addr, 'values': [[pen_formula]]})
-        tenant_ws.batch_update(body, value_input_option='USER_ENTERED')
+    # 7) Ensure conditional formatting exists (only once per run per sheet)
+    _ensure_conditional_formatting(ws, header_row0, colmap, _sheet_cache[title])
 
     return {
-        'sheet': tenant_ws.title,
-        'month_row': row_abs_1based,
-        'paid_before': paid0,
-        'paid_after': paid1,
-        'ref_added': payment['REF Number'],
-        'formulas_set': {'balance': needs_bal, 'penalties': needs_pen},
+        "sheet": ws.title,
+        "row": row_abs,
+        "month": month_display,
+        "paid_before": paid_before,
+        "paid_after": paid_after,
+        "date_due": due_str,
     }
+
