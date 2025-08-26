@@ -38,6 +38,7 @@ st.caption("Uses your own Google OAuth. Nothing is stored server-side beyond sta
 st.divider()
 
 # ---------------- OAUTH CONFIG ----------------
+# ---------------- OAUTH CONFIG ----------------
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -60,47 +61,87 @@ def build_flow():
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_secret": CLIENT_SECRET,
             "redirect_uris": [REDIRECT_URI],
+            "javascript_origins": [REDIRECT_URI],
         }
     }
     return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
 def get_creds():
     if "creds_json" in st.session_state:
-        return Credentials.from_authorized_user_info(json.loads(st.session_state["creds_json"]), SCOPES)
+        return Credentials.from_authorized_user_info(
+            json.loads(st.session_state["creds_json"]), SCOPES
+        )
     return None
 
 def store_creds(creds: Credentials):
     st.session_state["creds_json"] = creds.to_json()
 
-# OAuth refresh
+# Refresh if possible
 creds = get_creds()
 if creds and not creds.valid and creds.refresh_token:
     try:
-        creds.refresh(Request()); store_creds(creds)
+        creds.refresh(Request())
+        store_creds(creds)
     except Exception:
         creds = None
 
-# OAuth callback
-params = st.query_params
-if "code" in params and "state" in params and "creds_json" not in st.session_state:
-    flow = build_flow()
-    flow.fetch_token(code=params["code"])
-    creds = flow.credentials
-    store_creds(creds)
-    st.query_params.clear()
-    st.success("Signed in to Google successfully.")
-    st.rerun()
-
-# Auth gate
+# ---------- OAuth entrypoint ----------
 if not creds or not creds.valid:
+    # If we’re returning from Google with ?code=... handle it first
+    params = dict(st.query_params)
+    if "code" in params:
+        # Validate state to prevent CSRF & accidental reruns with stale codes
+        if "state" in params and params["state"] != st.session_state.get("oauth_state"):
+            st.error("OAuth state mismatch. Try signing in again.")
+            st.query_params.clear()
+            st.stop()
+
+        flow = build_flow()
+        try:
+            # Primary: exchange using the code (redirect_uri is already set on the flow)
+            flow.fetch_token(code=params["code"])
+        except Exception:
+            # Fallback: build the full authorization_response URL and retry
+            try:
+                # Reconstruct ?query string
+                q = "&".join(f"{k}={v}" for k, v in params.items())
+                authorization_response = f"{REDIRECT_URI}?{q}"
+                flow.fetch_token(authorization_response=authorization_response)
+            except Exception as e:
+                st.error(
+                    "OAuth token exchange failed. "
+                    "Check that your Google Cloud OAuth **Authorized redirect URI** "
+                    f"matches exactly: {REDIRECT_URI}\n\n"
+                    "Also ensure the OAuth client type is **Web application**, not Desktop, "
+                    "and try again (incognito can help)."
+                )
+                st.query_params.clear()
+                st.stop()
+
+        creds = flow.credentials
+        store_creds(creds)
+        st.query_params.clear()
+        st.success("Signed in to Google successfully.")
+        st.rerun()
+
+    # No creds and not returning from Google: start the flow
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",   # must be "true"/"false" strings
+        include_granted_scopes="true",  # must be "true"/"false" string
         prompt="consent",
     )
-    st.link_button("🔐 Sign in with Google", auth_url, help="Authorize Gmail & Sheets.", use_container_width=True)
+    st.session_state["oauth_state"] = state
+    st.session_state["oauth_redirect_uri"] = REDIRECT_URI
+
+    st.link_button(
+        "🔐 Sign in with Google",
+        auth_url,
+        help="Authorize Gmail & Sheets access",
+        use_container_width=True,
+    )
     st.stop()
+
 
 # ---------------- INPUTS ----------------
 sheet_url = st.text_input(
