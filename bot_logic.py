@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-bot_logic.py — quota-friendly, non-destructive updater for RentRAP
+bot_logic.py — non-destructive, header-row aware updater for RentRPA
 
 What it does:
-- NORMALIZES headers by renaming recognized columns; never deletes user data.
-- APPENDS any missing canonical columns at the far right (including "Comments").
-- NEW rows: carry forward last "Amount Due"; always set "Date due" to 5th; default Comments="None".
-- Robust "Penalties" (late > 2 days -> 3000) & rolling "Prepayment/Arrears" formulas (work with text or true date cells).
-- Adds conditional formatting: arrears<0 (light red), penalties>0 (light yellow).
-- Per-sheet in-memory cache + batch writes to minimize API reads.
-- Returns keys compatible with older streamlit code: month_row, ref_added, formulas_set, etc.
+- Detects the actual header row per sheet (row 7 in your layout, or any other).
+- Maps existing headers via aliases (NO renaming, NO deletions).
+- Appends missing canonical columns at the far right (Comments included).
+- Writes inside the existing data block (right under your history), not at sheet bottom.
+- Carries forward "Amount Due"; Date due = 5th (value).
+- Robust formulas for Penalties + Prepayment/Arrears (work with text or serial dates).
+- Conditional formatting: arrears<0 light red; penalties>0 light yellow.
+- Expands grid before writes to avoid "exceeds grid limits".
+- Per-sheet in-memory cache to reduce API reads.
+- Return keys include both new + backward-compat fields.
 """
 
 from __future__ import annotations
 import re, time
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from googleapiclient.errors import HttpError
 from gspread.utils import rowcol_to_a1
 
 # ---------------- Parsing (M-Pesa emails) ----------------
@@ -90,7 +92,7 @@ def _alias_key_for(normalized_header: str) -> Optional[str]:
     return None
 
 def _header_colmap(header: List[str]) -> Dict[str, int]:
-    """Map canonical keys → column index from a concrete header row."""
+    """Map canonical keys → column index from a concrete header row (no renames)."""
     colmap: Dict[str,int] = {}
     seen = set()
     for idx, name in enumerate(header):
@@ -116,59 +118,17 @@ def _with_backoff(fn, *args, **kwargs):
                 time.sleep(delay); delay *= 2; continue
             raise
 
-# --- Header row detection -----------------------------------------------------
-
-def _detect_header_row(all_vals, scan_rows: int = 30) -> int:
-    """
-    Return the 0-based index of the header row by scoring the first `scan_rows`
-    rows for known/canonical/aliased column names. Falls back to row 0.
-    """
-    def score(row):
-        s = 0
-        for cell in row:
-            txt = str(cell or "").strip()
-            if not txt:
-                continue
-            if txt in CANONICAL_SET:
-                s += 1
-            else:
-                if _alias_key_for(_norm_header(txt)):
-                    s += 1
-        return s
-
-    best_i, best_score = 0, 0
-    limit = min(len(all_vals), max(1, scan_rows))
-    for i in range(limit):
-        sc = score(all_vals[i])
-        if sc > best_score:
-            best_i, best_score = i, sc
-    # require at least a few matches to accept; otherwise assume first row
-    return best_i if best_score >= 3 else 0
-
-
 def _ensure_grid_size(ws, need_rows: int = None, need_cols: int = None):
     """Make sure the worksheet has at least the requested rows/cols before writes."""
     try:
-        # Refresh counts (these can be stale on long-lived objects)
         cur_rows = ws.row_count
         cur_cols = ws.col_count
-
         if need_rows is not None and need_rows > cur_rows:
             _with_backoff(ws.add_rows, need_rows - cur_rows)
         if need_cols is not None and need_cols > cur_cols:
             _with_backoff(ws.add_cols, need_cols - cur_cols)
     except Exception:
-        # As a fallback, attempt again with fresh counts
-        try:
-            cur_rows = ws.row_count
-            cur_cols = ws.col_count
-            if need_rows is not None and need_rows > cur_rows:
-                ws.add_rows(need_rows - cur_rows)
-            if need_cols is not None and need_cols > cur_cols:
-                ws.add_cols(need_cols - cur_cols)
-        except Exception:
-            pass
-
+        pass
 
 # ---------------- Month parsing/formatting ----------------
 
@@ -215,7 +175,7 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
         sheet_id = ws.id
     except Exception:
         return
-    start_row = header_row0 + 1
+    start_row = header_row0 + 1  # 0-based: first data row
     requests = [
         {   # Arrears < 0
             "addConditionalFormatRule": {
@@ -258,41 +218,49 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
     except Exception:
         pass
 
-# ---------------- Non-destructive header normalization ----------------
+# ---------------- Header row detection & normalization ----------------
 
-def _normalize_header_non_destructive(ws, header: List[str], rows: List[List[str]]) -> Tuple[List[str], List[List[str]], Dict[str,int], bool]:
+def _detect_header_row(all_vals, scan_rows: int = 30) -> int:
+    """Return 0-based index of the header row by scoring the first `scan_rows` rows."""
+    def score(row):
+        s = 0
+        for cell in row:
+            txt = str(cell or "").strip()
+            if not txt:
+                continue
+            if txt in CANONICAL_SET or _alias_key_for(_norm_header(txt)):
+                s += 1
+        return s
+    best_i, best_score = 0, 0
+    limit = min(len(all_vals), max(1, scan_rows))
+    for i in range(limit):
+        sc = score(all_vals[i])
+        if sc > best_score:
+            best_i, best_score = i, sc
+    return best_i if best_score >= 3 else 0
+
+def _normalize_header_non_destructive(ws, header: List[str], rows: List[List[str]]):
     """
-    - Renames recognized headers to canonical names (no deletions).
-    - Appends missing canonical columns at the FAR RIGHT.
-    - Returns (header, rows, colmap, comments_was_added_now).
+    - DO NOT rename existing headers.
+    - Map via aliases; only append truly missing canonical columns at FAR RIGHT.
+    - Returns (header, rows, colmap, comments_added_now).
     """
     comments_added_now = False
+    colmap_existing = _header_colmap(header)
 
-    # rename recognized headers in-place
-    for i, name in enumerate(header):
-        if name in CANONICAL_SET:
-            continue
-        alias = _alias_key_for(_norm_header(name))
-        if alias:
-            header[i] = CANONICAL_NAME[alias]
-
-    # append missing canonical columns on the RIGHT
-    present = set(header)
+    added_any = False
     for key in REQUIRED_KEYS:
-        canon = CANONICAL_NAME[key]
-        if canon not in present:
-            header.append(canon)
-            present.add(canon)
+        if key not in colmap_existing:
+            header.append(CANONICAL_NAME[key])
+            for r in rows:
+                r.append("None" if key == "comments" else "")
+            added_any = True
             if key == "comments":
                 comments_added_now = True
-                # DO NOT backfill existing rows here (we keep existing data untouched)
-                # Only new rows will default to "None"
-            # pad existing rows length if needed when we later write/appends
 
-    # make sure sheet has enough columns to display header (no-op if already enough)
     try:
-        if ws.col_count < len(header):
-            ws.add_cols(len(header) - ws.col_count)
+        if added_any and ws.col_count < len(header):
+            _with_backoff(ws.add_cols, len(header) - ws.col_count)
     except Exception:
         pass
 
@@ -310,34 +278,29 @@ def clear_cache():
 
 def update_tenant_month_row(ws, payment: Dict) -> Dict:
     """
-    Update a tenant worksheet for a payment dict.
+    Update a tenant worksheet for a payment dict, writing inside the existing data block.
 
-    Non-destructive + quota-friendly:
-      - Read whole sheet once (first time per sheet per run) → cache {header, rows, colmap}.
-      - Normalize header ONLY by renaming and appending; NO deletions of user columns.
-      - Find-or-create month row; update values; write with a single batch_update.
-      - Apply CF rules once per run per sheet.
+    Steps:
+      - Read once (per sheet/run), detect header row, non-destructive header normalization.
+      - Find existing month row; else create a new row at the next data line (NOT bottom-of-sheet).
+      - Update values and formulas; ensure grid; apply CF once per run.
     """
     title = ws.title
 
     # Prime cache (read once per sheet/run)
     if title not in _sheet_cache:
         all_vals = _with_backoff(ws.get_all_values)  # one read
-        header_row0 = _detect_header_row(all_vals)   # <-- auto-detect (row 6 for row 7 headers)
+        header_row0 = _detect_header_row(all_vals)   # 0-based (6 for visible row 7)
         header = list(all_vals[header_row0]) if len(all_vals) > header_row0 else []
         rows   = [list(r) for r in all_vals[header_row0+1:]] if len(all_vals) > header_row0+1 else []
 
-        # Non-destructive normalization: rename recognized headers, append missing canonicals at FAR RIGHT
-        header, rows, colmap, comments_added_now = _normalize_header_non_destructive(ws, header, rows)
+        header, rows, colmap, _ = _normalize_header_non_destructive(ws, header, rows)
 
-        # Make sure grid can fit that header row
+        # Ensure grid & write header back to the ACTUAL header row (not row 1)
         _ensure_grid_size(ws, need_rows=header_row0+1, need_cols=len(header))
-
-        # Write back header to *that* row only (not row 1!)
         header_a1 = f"{header_row0+1}:{header_row0+1}"
         _with_backoff(ws.update, header_a1, [header])
 
-        # Cache
         _sheet_cache[title] = {
             "header_row0": header_row0,
             "header": header,
@@ -352,48 +315,51 @@ def update_tenant_month_row(ws, payment: Dict) -> Dict:
     rows         = cache["rows"]
     colmap       = cache["colmap"]
 
-
-    # Parse payment date → target month
+    # Target month from payment date
     dt_paid = datetime.strptime(payment['Date Paid'], '%d/%m/%Y %I:%M %p')
     target_y, target_m = dt_paid.year, dt_paid.month
     existing_month_samples = [r[colmap['month']] for r in rows if len(r) > colmap['month'] and r[colmap['month']]]
     month_display = _choose_month_display(existing_month_samples, dt_paid)
 
-    # Find month row by parsing month cells (handles mixed formats)
+    # 1) Find existing month row within the data block
     row_abs = None
-    for i, r in enumerate(rows, start=2):
-        if len(r) <= colmap['month']: continue
+    row_idx = None  # 0-based within rows[]
+    for idx_in_rows, r in enumerate(rows, start=1):  # first data row is +1 after header
+        if len(r) <= colmap['month']:
+            continue
         ym = _parse_month_cell(r[colmap['month']])
         if ym and ym == (target_y, target_m):
-            row_abs = i; break
+            row_idx = idx_in_rows - 1
+            row_abs = header_row0 + 1 + idx_in_rows  # absolute 1-based row in the sheet
+            break
 
-    # If not found, create new row (default Comments = "None")
+    # 2) If not found, create a NEW row at the next line of the data block (NOT bottom of sheet)
     if row_abs is None:
-        # carry forward Amount Due from last non-empty row
         last_due = "0"
         for r in reversed(rows):
             if len(r) > colmap['amount_due'] and str(r[colmap['amount_due']]).strip():
-                last_due = r[colmap['amount_due']]; break
+                last_due = r[colmap['amount_due']]
+                break
+
         new_row = [""] * len(header)
-        new_row[colmap['month']] = month_display
+        new_row[colmap['month']]      = month_display
         new_row[colmap['amount_due']] = last_due
         if "comments" in colmap:
             new_row[colmap['comments']] = "None"
+
+        # in-memory append
         rows.append(new_row)
+        row_idx = len(rows) - 1
+        row_abs = header_row0 + 1 + (row_idx + 1)
 
-        # Ensure we have enough columns to hold the entire row we’re appending
-        _ensure_grid_size(ws, need_rows=ws.row_count + 1, need_cols=len(header))
+        # ensure row exists and is wide enough, then write the full row in place
+        _ensure_grid_size(ws, need_rows=row_abs, need_cols=len(header))
+        _with_backoff(ws.update, f"{row_abs}:{row_abs}", [new_row], value_input_option='USER_ENTERED')
 
-        _with_backoff(ws.append_row, new_row, value_input_option='USER_ENTERED')
-        row_abs = len(rows) + 1  # header + rows
-
-
-    # Work with cached row
-    row_idx = row_abs - 2
-    if row_idx >= len(rows):
-        rows.extend([[""]*len(header) for _ in range(row_idx - len(rows) + 1)])
+    # 3) Update values (do NOT touch Comments if user set one)
     row_vals = rows[row_idx]
-    while len(row_vals) < len(header): row_vals.append("")
+    while len(row_vals) < len(header):
+        row_vals.append("")
 
     def _num(v):
         try: return float(str(v).replace(",", "").strip() or 0)
@@ -405,32 +371,36 @@ def update_tenant_month_row(ws, payment: Dict) -> Dict:
     ref_new     = payment['REF Number'] if not prev_ref else f"{prev_ref}, {payment['REF Number']}"
     due_str     = datetime(target_y, target_m, 5).strftime("%d/%m/%Y")
 
-    # Update cached row (do NOT touch Comments if user has one)
     row_vals[colmap['month']]       = month_display
     row_vals[colmap['amount_paid']] = str(paid_after)
     row_vals[colmap['date_paid']]   = payment['Date Paid']
     row_vals[colmap['ref']]         = ref_new
     row_vals[colmap['date_due']]    = due_str
 
-    # Build formulas (robust to text/serial dates)
+    # 4) Formulas (robust to text/serial dates)
     amt_paid_addr  = rowcol_to_a1(row_abs, colmap['amount_paid']+1)
     amt_due_addr   = rowcol_to_a1(row_abs, colmap['amount_due']+1)
     date_paid_addr = rowcol_to_a1(row_abs, colmap['date_paid']+1)
     date_due_addr  = rowcol_to_a1(row_abs, colmap['date_due']+1)
     pen_addr       = rowcol_to_a1(row_abs, colmap['penalties']+1)
-    bal_addr       = rowcol_to_a1(row_abs, colmap['prepay_arrears']+1)
     prev_bal_addr  = rowcol_to_a1(row_abs-1, colmap['prepay_arrears']+1)
 
     dpaid_expr  = f"IF(ISTEXT({date_paid_addr}), DATEVALUE(LEFT({date_paid_addr},10)), {date_paid_addr})"
     ddue_expr   = f"IF(ISTEXT({date_due_addr}),  DATEVALUE({date_due_addr}),           {date_due_addr})"
     pen_formula = f"=IF(AND(ISNUMBER({dpaid_expr}), ISNUMBER({ddue_expr}), {dpaid_expr}>{ddue_expr}+2),3000,0)"
 
-    if row_abs == cache["header_row0"] + 2:
+    # Rolling balance (Prepayment/Arrears)
+    if row_abs == _sheet_cache[title]["header_row0"] + 2:
         bal_formula = f"=N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
     else:
         bal_formula = f"=N({prev_bal_addr})+N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
 
-    # Single batch write for values + formulas
+    # 5) Single batch write to the exact row/cols (ensure grid first)
+    _target_cols = [
+        colmap['month']+1, colmap['amount_paid']+1, colmap['date_paid']+1,
+        colmap['ref']+1, colmap['date_due']+1, colmap['penalties']+1, colmap['prepay_arrears']+1
+    ]
+    _ensure_grid_size(ws, need_rows=row_abs, need_cols=max(_target_cols))
     updates = [
         {"range": rowcol_to_a1(row_abs, colmap['month']+1),         "values": [[month_display]]},
         {"range": rowcol_to_a1(row_abs, colmap['amount_paid']+1),   "values": [[paid_after]]},
@@ -440,32 +410,19 @@ def update_tenant_month_row(ws, payment: Dict) -> Dict:
         {"range": rowcol_to_a1(row_abs, colmap['penalties']+1),     "values": [[pen_formula]]},
         {"range": rowcol_to_a1(row_abs, colmap['prepay_arrears']+1),"values": [[bal_formula]]},
     ]
-    # Max column index we’re about to touch (1-based)
-    _target_cols = [
-        colmap['month']+1,
-        colmap['amount_paid']+1,
-        colmap['date_paid']+1,
-        colmap['ref']+1,
-        colmap['date_due']+1,
-        colmap['penalties']+1,
-        colmap['prepay_arrears']+1,
-        ]
-    _ensure_grid_size(ws, need_rows=row_abs, need_cols=max(_target_cols))
-
-
     _with_backoff(ws.batch_update, updates, value_input_option='USER_ENTERED')
 
-    # Ensure CF rules exist (once per run per sheet)
-    _ensure_conditional_formatting(ws, cache["header_row0"], colmap, cache)
+    # 6) Conditional formatting (once per run per sheet)
+    _ensure_conditional_formatting(ws, _sheet_cache[title]["header_row0"], colmap, _sheet_cache[title])
 
     return {
         "sheet": ws.title,
-        "row": row_abs,                  # for new code
-        "month": month_display,          # for new code
+        "row": row_abs,
+        "month": month_display,
         "paid_before": paid_before,
         "paid_after": paid_after,
         "date_due": due_str,
-        # Backwards-compat fields expected by older streamlit_app.py:
+        # Back-compat
         "month_row": row_abs,
         "ref_added": payment.get("REF Number"),
         "formulas_set": {"balance": True, "penalties": True},
