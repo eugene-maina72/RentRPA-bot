@@ -33,7 +33,7 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 ├── requirements.txt         # Python dependencies
 ├── prototype.py             # Prototype program(Local running)
 ├── streamlit_app.py         # Main Streamlit UI file
-└── bot_functions.py         # Backend logic for email parsing & Sheets updating
+└── bot_logic.py         # Backend logic for email parsing & Sheets updating
 
 ```
 
