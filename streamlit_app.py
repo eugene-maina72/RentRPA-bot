@@ -60,6 +60,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly"
 ]
+
+
 ENV            = st.secrets.get("ENV", "local")
 CLIENT_ID      = st.secrets["google_oauth"]["client_id"]
 CLIENT_SECRET  = st.secrets["google_oauth"]["client_secret"]
@@ -71,7 +73,7 @@ def build_flow():
     client_config = {
         "web": {
             "client_id": CLIENT_ID,
-            "project_id": "Rent-rpa",
+            "project_id": "RentRPA",
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
@@ -83,41 +85,88 @@ def build_flow():
 
 def get_creds():
     if "creds_json" in st.session_state:
-        return Credentials.from_authorized_user_info(json.loads(st.session_state["creds_json"]), SCOPES)
+        return Credentials.from_authorized_user_info(
+            json.loads(st.session_state["creds_json"]), SCOPES
+        )
     return None
 
 def store_creds(creds: Credentials):
     st.session_state["creds_json"] = creds.to_json()
 
-# OAuth: refresh if possible
+# Optional: sign out
+col_signout, _ = st.columns([1, 5])
+with col_signout:
+    if st.button("Sign out", help="Clear cached OAuth and re-authenticate"):
+        st.session_state.pop("creds_json", None)
+        st.session_state.pop("oauth_state", None)
+        st.rerun()
+
+# Try refresh if we already have creds
 creds = get_creds()
 if creds and not creds.valid and creds.refresh_token:
     try:
-        creds.refresh(Request()); store_creds(creds)
+        creds.refresh(Request())
+        store_creds(creds)
     except Exception:
         creds = None
 
-# OAuth callback
-params = st.query_params
-if "code" in params and "state" in params and "creds_json" not in st.session_state:
-    flow = build_flow()
-    flow.fetch_token(code=params["code"])
-    creds = flow.credentials
-    store_creds(creds)
-    st.query_params.clear()
-    st.success("Signed in to Google successfully.")
-    st.rerun()
-
-# Auth gate
+# ---------- OAuth entrypoint ----------
 if not creds or not creds.valid:
+    # Normalize query params (Streamlit may hand lists)
+    params = {k: (v[0] if isinstance(v, list) else v) for k, v in st.query_params.items()}
+    code = params.get("code")
+    state_param = params.get("state")
+
+    if code:
+        expected_state = st.session_state.get("oauth_state")
+        if expected_state and state_param and state_param != expected_state:
+            st.warning("OAuth state mismatch (session likely restarted). Attempting token exchange anyway…")
+
+        flow = build_flow()
+        # Primary attempt
+        try:
+            flow.fetch_token(code=code)
+        except Exception:
+            # Fallback: try full authorization_response URL
+            try:
+                q = "&".join(f"{k}={v}" for k, v in params.items())
+                authorization_response = f"{REDIRECT_URI}?{q}"
+                flow.fetch_token(authorization_response=authorization_response)
+            except Exception as e:
+                st.error(
+                    "OAuth token exchange failed.\n\n"
+                    "Double-check Google Cloud Console → OAuth Client:\n"
+                    f"• Authorized redirect URI: {REDIRECT_URI}\n"
+                    "• Client type: Web application (not Desktop)\n"
+                    "If issues persist, try a new incognito window."
+                )
+                st.query_params.clear()
+                st.stop()
+
+        creds = flow.credentials
+        store_creds(creds)
+        st.query_params.clear()
+        st.success("Signed in to Google successfully.")
+        st.rerun()
+
+    # No code yet: start the auth flow
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",  # must be string "true"/"false"
+        include_granted_scopes="true",  # must be "true"/"false" strings
         prompt="consent",
     )
-    st.link_button("🔐 Sign in with Google", auth_url, help="Authorize Gmail & Sheets. We only act on your behalf.", use_container_width=True)
+    st.session_state["oauth_state"] = state
+    st.link_button(
+        "🔐 Sign in with Google",
+        auth_url,
+        help="Authorize Gmail & Sheets access",
+        use_container_width=True,
+    )
     st.stop()
+
+
+
 
 # ---------------- INPUTS ----------------
 sheet_url = st.text_input(
