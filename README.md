@@ -87,7 +87,7 @@ streamlit run streamlit_app.py
 
     * Deploy and run the app!
     
-    * The bot is already deployed [here](lemaiyan-rpa.streamlit.app) 
+    * The bot is already deployed [here](https://lemaiyan-rpa.streamlit.app) 
 
 ## 📈 How It Works
 
