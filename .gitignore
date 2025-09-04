@@ -215,3 +215,4 @@ client_secret.json
 bot_secret.json
 bot_service.json
 .streamlit
+deploy_secret.json
