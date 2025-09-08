@@ -33,11 +33,17 @@ from gspread.exceptions import APIError
 
 # Extra: capture common OAuth errors to show helpful guidance
 try:
-    from oauthlib.oauth2.rfc6749.errors import InvalidGrantError, MismatchedStateError  # type: ignore
+    from oauthlib.oauth2.rfc6749.errors import (
+        InvalidGrantError,
+        MismatchingStateError,
+        InvalidClientError,
+        InvalidRequestError,
+    )  # type: ignore
 except Exception:  # pragma: no cover
     InvalidGrantError = Exception  # fallback if package surface changes
-    MismatchedStateError = Exception
-
+    MismatchingStateError = Exception
+    InvalidClientError = Exception
+    InvalidRequestError = Exception
 
 from bot_logic import (
     PATTERN,
@@ -70,12 +76,11 @@ st.caption("Uses your Google OAuth; tokens are stored in-memory only for the ses
 # 1) OAUTH CONFIG — lenient and debug-friendly
 # ---------------------------------------------------------------------------
 
-# ---------------- OAUTH CONFIG ----------------
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly"
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 ENV            = st.secrets.get("ENV", "local")
 CLIENT_ID      = st.secrets["google_oauth"]["client_id"]
@@ -84,9 +89,10 @@ REDIRECT_LOCAL = st.secrets["google_oauth"]["redirect_uri_local"]
 REDIRECT_PROD  = st.secrets["google_oauth"]["redirect_uri_prod"]
 REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
+
 def build_flow(state: str | None = None) -> Flow:
     """Create an OAuth 2.0 Flow; `state` is persisted across the auth dance.
-        Why: Google checks `state` to prevent CSRF — mismatches raise InvalidGrant.
+    Why: Google checks `state` to prevent CSRF — mismatches raise InvalidGrant.
     """
     client_config = {
         "web": {
@@ -99,21 +105,68 @@ def build_flow(state: str | None = None) -> Flow:
             "redirect_uris": [REDIRECT_URI],
         }
     }
-      # Pass both redirect and state so the callback Flow matches the initial one
+    # Pass both redirect and state so the callback Flow matches the initial one
     return Flow.from_client_config(
         client_config,
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
-        state=state
+        state=state,
     )
+
 
 def get_creds():
     if "creds_json" in st.session_state:
         return Credentials.from_authorized_user_info(json.loads(st.session_state["creds_json"]), SCOPES)
     return None
 
+
 def store_creds(creds: Credentials):
     st.session_state["creds_json"] = creds.to_json()
+
+
+# ---------------------------------------------------------------------------
+# 1a) OAUTH SETUP CHECKER — prevents Error 400: invalid_request
+# ---------------------------------------------------------------------------
+
+def oauth_setup_checker():
+    """Static checks to catch redirect/client mistakes before hitting Google."""
+    issues: list[str] = []
+    tips: list[str] = []
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        issues.append("Missing CLIENT_ID or CLIENT_SECRET in st.secrets['google_oauth'].")
+    if not REDIRECT_URI:
+        issues.append("Missing REDIRECT_URI (set redirect_uri_local / redirect_uri_prod in secrets).")
+    else:
+        if not REDIRECT_URI.startswith(("http://", "https://")):
+            issues.append("REDIRECT_URI must start with http:// or https://")
+        if "streamlit.app" in REDIRECT_URI and not REDIRECT_URI.endswith("/"):
+            tips.append("For Streamlit Cloud, use a trailing slash, e.g., https://your-app.streamlit.app/ ")
+        if "localhost" in REDIRECT_URI:
+            if not REDIRECT_URI.startswith("http://"):
+                tips.append("For localhost, use http:// (not https://) and include the exact port, e.g., http://localhost:8501/")
+        if REDIRECT_URI.endswith("/") is False:
+            tips.append("Ensure the exact trailing slash matches what you registered in GCP.")
+
+    tips.append("In Google Cloud Console › Credentials, the OAuth client type must be **Web application**. Desktop/Other will 400.")
+    tips.append("Authorized redirect URIs must include this exact REDIRECT_URI (case, scheme, host, path, and trailing slash).")
+
+    with st.expander("🔧 OAuth Setup Checker (click to verify before Sign in)", expanded=False):
+        st.code(
+            {
+                "ENV": ENV,
+                "CLIENT_ID_suffix": CLIENT_ID[-12:] if CLIENT_ID else None,
+                "REDIRECT_URI": REDIRECT_URI,
+                "SCOPES": SCOPES,
+            },
+            language="json",
+        )
+        if issues:
+            st.error("\n".join(f"• {i}" for i in issues))
+        if tips:
+            st.info("\n".join(f"• {t}" for t in tips))
+
+    return not issues  # True if basic setup looks OK
 
 # OAuth: refresh if possible
 creds = get_creds()
@@ -121,8 +174,8 @@ if creds and not creds.valid and creds.refresh_token:
     try:
         creds.refresh(Request()); store_creds(creds)
     except Exception:
+        # Why: refresh_token can be revoked or expired; force re-auth cleanly.
         creds = None
-
 
 # OAuth callback
 params = st.query_params
@@ -139,10 +192,10 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
     try:
         # Use the code we just received
         flow.fetch_token(code=params["code"])
-    except MismatchedStateError:
-        st.error("OAuth state mismatch during token exchange. Retry sign-in.")
+    except (MismatchingStateError, InvalidRequestError):
+        st.error("OAuth state/parameters invalid during token exchange. Retry sign-in.")
         st.stop()
-    except InvalidGrantError as e:  # pragma: no cover
+    except (InvalidClientError, InvalidGrantError) as e:  # pragma: no cover
         # Purposefully concise but actionable diagnostics
         st.error(
             "Google rejected the OAuth exchange (invalid_grant). Common causes: redirect URI mismatch, reused/expired code, or clock skew.")
@@ -164,6 +217,9 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
 
 # Auth gate
 if not creds or not creds.valid:
+    # Show setup checker to pre-empt invalid_request before opening Google
+    oauth_setup_checker()
+
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
