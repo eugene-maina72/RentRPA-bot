@@ -31,12 +31,20 @@ from google.auth.transport.requests import Request
 import gspread
 from gspread.exceptions import APIError
 
+# Extra: capture common OAuth errors to show helpful guidance
+try:
+    from oauthlib.oauth2.rfc6749.errors import InvalidGrantError, MismatchedStateError  # type: ignore
+except Exception:  # pragma: no cover
+    InvalidGrantError = Exception  # fallback if package surface changes
+    MismatchedStateError = Exception
+
+
 from bot_logic import (
     PATTERN,
     parse_email,
     update_tenant_month_row,
     PAYMENT_COLS,
-    clear_cache,           # to reset per-sheet cache between runs
+    clear_cache           # to reset per-sheet cache between runs
 )
 
 # ---------------------------------------------------------------------------
@@ -76,7 +84,10 @@ REDIRECT_LOCAL = st.secrets["google_oauth"]["redirect_uri_local"]
 REDIRECT_PROD  = st.secrets["google_oauth"]["redirect_uri_prod"]
 REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
-def build_flow():
+def build_flow(state: str | None = None) -> Flow:
+    """Create an OAuth 2.0 Flow; `state` is persisted across the auth dance.
+        Why: Google checks `state` to prevent CSRF — mismatches raise InvalidGrant.
+    """
     client_config = {
         "web": {
             "client_id": CLIENT_ID,
@@ -88,7 +99,13 @@ def build_flow():
             "redirect_uris": [REDIRECT_URI],
         }
     }
-    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+      # Pass both redirect and state so the callback Flow matches the initial one
+    return Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+        state=state
+    )
 
 def get_creds():
     if "creds_json" in st.session_state:
@@ -106,11 +123,39 @@ if creds and not creds.valid and creds.refresh_token:
     except Exception:
         creds = None
 
+
 # OAuth callback
 params = st.query_params
 if "code" in params and "state" in params and "creds_json" not in st.session_state:
-    flow = build_flow()
-    flow.fetch_token(code=params["code"])
+    returned_state = params.get("state")
+    saved_state = st.session_state.get("oauth_state")
+
+    # Guard: if the state doesn't match, stop to avoid CSRF & invalid_grant
+    if saved_state and returned_state != saved_state:
+        st.error("OAuth state mismatch. Please retry sign-in. If this repeats, clear cookies and ensure only one app tab is open.")
+        st.stop()
+
+    flow = build_flow(state=saved_state)
+    try:
+        # Use the code we just received
+        flow.fetch_token(code=params["code"])
+    except MismatchedStateError:
+        st.error("OAuth state mismatch during token exchange. Retry sign-in.")
+        st.stop()
+    except InvalidGrantError as e:  # pragma: no cover
+        # Purposefully concise but actionable diagnostics
+        st.error(
+            "Google rejected the OAuth exchange (invalid_grant). Common causes: redirect URI mismatch, reused/expired code, or clock skew.")
+        with st.expander("Debug details"):
+            st.write({
+                "ENV": ENV,
+                "REDIRECT_URI": REDIRECT_URI,
+                "query_state": returned_state,
+                "saved_state": saved_state,
+                "hint": "Ensure this REDIRECT_URI is registered in Google Cloud Console > OAuth consent screen > Credentials > Authorized redirect URIs.",
+            })
+        st.stop()
+
     creds = flow.credentials
     store_creds(creds)
     st.query_params.clear()
@@ -122,11 +167,21 @@ if not creds or not creds.valid:
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",  # must be string "true"/"false"
+        include_granted_scopes=True,  # bool here, library formats as needed
         prompt="consent",
     )
-    st.link_button("🔐 Sign in with Google", auth_url, help="Authorize Gmail & Sheets. We only act on your behalf.", use_container_width=True)
+    # Persist state so the callback can verify it and rebuild Flow
+    st.session_state["oauth_state"] = state
+
+    st.link_button(
+        "🔐 Sign in with Google",
+        auth_url,
+        help="Authorize Gmail & Sheets. We only act on your behalf.",
+        use_container_width=True,
+    )
     st.stop()
+
+
 
 # ---------------------------------------------------------------------------
 # 2) INPUT CONTROLS
