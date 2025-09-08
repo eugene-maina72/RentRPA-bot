@@ -223,7 +223,7 @@ if not creds or not creds.valid:
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes=True,  # bool here, library formats as needed
+        include_granted_scopes='true',  # bool here, library formats as needed
         prompt="consent",
     )
     # Persist state so the callback can verify it and rebuild Flow
