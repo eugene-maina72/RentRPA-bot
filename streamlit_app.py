@@ -62,7 +62,7 @@ st.title("🏠 Rent RPA — Gmail → Google Sheets")
 
 st.markdown(
     """
-<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#0000ff;margin-bottom:8px">
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#877f7d;margin-bottom:8px">
 <b>What this does:</b> Scans Gmail for rent payments and logs them into your Google Sheet (per-tenant tabs).<br>
 <b>Rules:</b> Date due = <b>5th</b> of the month. <b>Penalty</b> = 3000 KES if payment > due + 2 days. <b>Prepayment/Arrears</b> rolls forward.<br>
 <b>Safety:</b> Existing headers are preserved. Missing canonical columns are appended at the far right. <b>Comments</b> is never overwritten.
