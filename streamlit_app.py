@@ -406,6 +406,10 @@ if run_now:
     for m in messages:
         try:
             text = get_message_text(gmail, m["id"])
+
+            if "PAYLEMAIYAN" not in text.upper():
+                continue
+
             pay = parse_email(text)
             if not pay:
                 errors.append(f"Could not parse message id {m['id']}")

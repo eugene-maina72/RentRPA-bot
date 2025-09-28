@@ -45,17 +45,72 @@ import re as _re
 #  on 14/08/2025 12:04 PM. M-Pesa Ref: ABC123XYZ9"
 #
 # Tweak this regex if your bank format changes.
+# --- Flexible date pattern (named group 'dt') ---
+# Accepts:
+#  1)  dd/mm/YYYY hh:mm AM/PM       e.g., 14/08/2025 12:04 PM
+#  2)  YYYY-MM-DD HH:MM             e.g., 2025-08-14 12:04
+#  3)  YYYY/MM/DD HH:MM             e.g., 2025/08/14 12:04
+#  4)  dd-mm-YYYY HH:MM [AM/PM]?    e.g., 14-08-2025 12:04 or 14-08-2025 12:04 PM
+#  5)  dd/mm/YYYY HH:MM (24h)       e.g., 14/08/2025 17:45
+
+DATE_PAT = (
+    r'(?P<dt>('
+    r'\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}\s+[APMapm]{2}'            # 14/08/2025 12:04 PM
+    r'|'
+    r'\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}(?:\s?[APMapm]{2})?'  # 2025-08-14 12:04  OR 2025/08/14 12:04 [PM]
+    r'|'
+    r'\d{2}[-/]\d{2}[-/]\d{4}\s+\d{1,2}:\d{2}(?:\s?[APMapm]{2})?' # 14-08-2025 12:04 [PM]  OR 14/08/2025 17:45
+    r'))'
+)
+
+# See DATE_PAT above
 PATTERN = re.compile(
-    r'payment of KES ([\d,]+\.\d{2}) '
-    r'for account: PAYLEMAIYAN\s*#?\s*([A-Za-z]\d{1,2}) '
-    r'has been received from (.+?) (.{1,13}) '
-    r'on (\d{2}/\d{2}/\d{4} \d{1,2}:\d{2} [APM]{2})\. '
-    r'M-Pesa Ref: ([A-Z0-9]{10})',
+    rf'payment of KES ([\d,]+\.\d{{2}}) '
+    rf'for account: PAYLEMAIYAN\s*#?\s*([A-Za-z]\d{{1,2}}) '
+    rf'has been received from (.+?) (.{1,13}) '
+    rf'on {DATE_PAT}\. '
+    rf'M-Pesa Ref: ([A-Z0-9]{{10}})',
     re.I
 )
 
-# Columns written to the PaymentHistory meta sheet (Streamlit app uses this)
 PAYMENT_COLS = ['Date Paid','Amount Paid','REF Number','Payer','Phone','Payment Mode']
+
+def normalize_payer(name: str) -> str:
+    """Title-case the payer sensibly; trims extraneous whitespace."""
+    n = (name or "").strip()
+    # Simple title-case; enough for bank alerts. (If you want Mc/Mac rules, extend here.)
+    return " ".join(part.capitalize() for part in re.split(r"\s+", n) if part)
+
+def normalize_date_to_ddmmyyyy_ampm(dt_str: str) -> str:
+    """
+    Convert many common bank formats to 'DD/MM/YYYY hh:mm AM/PM'.
+    Falls back to original if unparseable (but our regex should ensure parseability).
+    """
+    dt_str = (dt_str or "").strip()
+    fmts = [
+        "%d/%m/%Y %I:%M %p",  # 14/08/2025 12:04 PM
+        "%Y-%m-%d %H:%M",     # 2025-08-14 12:04
+        "%Y/%m/%d %H:%M",     # 2025/08/14 12:04
+        "%d-%m-%Y %H:%M",     # 14-08-2025 12:04
+        "%d-%m-%Y %I:%M %p",  # 14-08-2025 12:04 PM
+        "%Y-%m-%d %I:%M %p",  # 2025-08-14 12:04 PM
+        "%d/%m/%Y %H:%M",     # 14/08/2025 17:45
+    ]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(dt_str, f)
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    # If a timezone sneaks in or spacing is weird, try normalizing whitespace and AM/PM case
+    dt_str2 = re.sub(r"\s+", " ", dt_str.upper())
+    for f in fmts:
+        try:
+            dt = datetime.strptime(dt_str2, f)
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return dt_str  # last resort
 
 def parse_email(text: str):
     """
@@ -65,16 +120,21 @@ def parse_email(text: str):
     m = PATTERN.search(text or "")
     if not m:
         return None
-    amt, code, payer, phone, dt, ref = m.groups()
+
+    amt, code, payer, phone, _, dt_str, ref = m.groups()
+    # groups: amount, account code, payer, phone, (DATE_PAT wrapper), dt_str, ref
+
     return {
-        'Date Paid': dt.strip(),
+        'Date Paid':   normalize_date_to_ddmmyyyy_ampm(dt_str),
         'Amount Paid': float(amt.replace(',', '')),
-        'REF Number': ref.upper(),
-        'Payer': payer.strip(),
-        'Phone': phone.strip(),
-        'Payment Mode': 'MPESA Payment',
-        'AccountCode': code.upper(),
+        'REF Number':  (ref or "").upper(),
+        'Payer':       normalize_payer(payer),
+        'Phone':       (phone or "").strip(),
+        'Payment Mode':'MPESA Payment',
+        'AccountCode': (code or "").upper(),
     }
+
+
 
 # ---------------------------------------------------------------------------
 # 1) HEADER/SCHEMA DEFINITIONS — canonical columns + alias matching
