@@ -19,6 +19,17 @@ Key UX / Safety details
 - The Comments column is never overwritten; new rows get "None" for Comments so a human can fill it in later.
 """
 
+"""
+Streamlit UI to ingest NCBA emails → Google Sheets.
+
+WHY these choices:
+- Safe OAuth flow & checker: avoids hard-crash when secrets missing.
+- Robust Gmail parsing with throttling & dedupe by REF.
+- History writes align with workbook header; tolerant to missing fields.
+- Optional tenant tab auto-create with canonical headers.
+- Portfolio metrics computed from PaymentHistory + per-tenant balances.
+"""
+
 import json, time, base64, re
 import streamlit as st
 import pandas as pd
@@ -34,23 +45,16 @@ from gspread.exceptions import APIError
 # Extra: capture common OAuth errors to show helpful guidance
 try:
     from oauthlib.oauth2.rfc6749.errors import (
-        InvalidGrantError,
-        MismatchingStateError,
-        InvalidClientError,
-        InvalidRequestError,
-    )  # type: ignore
+        InvalidGrantError, MismatchingStateError, InvalidClientError, InvalidRequestError,
+    )
 except Exception:  # pragma: no cover
-    InvalidGrantError = Exception  # fallback if package surface changes
-    MismatchingStateError = Exception
-    InvalidClientError = Exception
-    InvalidRequestError = Exception
+    InvalidGrantError = MismatchingStateError = InvalidClientError = InvalidRequestError = Exception
 
 from bot_logic import (
-    PATTERN,
     parse_email,
     update_tenant_month_row,
     PAYMENT_COLS,
-    clear_cache           # to reset per-sheet cache between runs
+    clear_cache
 )
 
 # ---------------------------------------------------------------------------
@@ -59,18 +63,16 @@ from bot_logic import (
 
 st.set_page_config(page_title="Rent RPA (Gmail → Sheets)", page_icon="🏠", layout="wide")
 st.title("🏠 Rent RPA — Gmail → Google Sheets")
-
 st.markdown(
     """
-<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#877f7d;margin-bottom:8px">
-<b>What this does:</b> Scans Gmail for rent payments and logs them into your Google Sheet (per-tenant tabs).<br>
-<b>Rules:</b> Date due = <b>5th</b> of the month. <b>Penalty</b> = 3000 KES if payment > due + 2 days. <b>Prepayment/Arrears</b> rolls forward.<br>
-<b>Safety:</b> Existing headers are preserved. Missing canonical columns are appended at the far right. <b>Comments</b> is never overwritten.
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#f7f5f4;margin-bottom:8px">
+<b>Rules:</b> Date due = <b>5th</b>. <b>Penalty</b> = 3000 KES if paid <i>after</i> due + 2 days and balance is negative.<br>
+<b>Safety:</b> We append missing headers; never overwrite <b>Comments</b>.
 </div>
 """,
     unsafe_allow_html=True,
 )
-st.caption("Uses your Google OAuth; tokens are stored in-memory only for the session. Nothing is persisted server-side.")
+st.caption("Tokens live only in your session memory. No server-side persistence.")
 
 # ---------------------------------------------------------------------------
 # 1) OAUTH CONFIG — lenient and debug-friendly
@@ -82,13 +84,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
-ENV            = st.secrets.get("ENV", "local")
-CLIENT_ID      = st.secrets["google_oauth"]["client_id"]
-CLIENT_SECRET  = st.secrets["google_oauth"]["client_secret"]
-REDIRECT_LOCAL = st.secrets["google_oauth"]["redirect_uri_local"]
-REDIRECT_PROD  = st.secrets["google_oauth"]["redirect_uri_prod"]
-REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
+ENV            = st.secrets.get("ENV", "local")
+GOOGLE_OAUTH   = st.secrets.get("google_oauth", {})
+CLIENT_ID      = GOOGLE_OAUTH.get("client_id")
+CLIENT_SECRET  = GOOGLE_OAUTH.get("client_secret")
+REDIRECT_LOCAL = GOOGLE_OAUTH.get("redirect_uri_local")
+REDIRECT_PROD  = GOOGLE_OAUTH.get("redirect_uri_prod")
+REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
 def build_flow(state: str | None = None) -> Flow:
     """Create an OAuth 2.0 Flow; `state` is persisted across the auth dance.
@@ -96,79 +99,45 @@ def build_flow(state: str | None = None) -> Flow:
     """
     client_config = {
         "web": {
-            "client_id": CLIENT_ID,
-            "project_id": "Rent-rpa",
+            "client_id": CLIENT_ID or "",
+            "project_id": "rent-rpa",
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_secret": CLIENT_SECRET,
-            "redirect_uris": [REDIRECT_URI],
+            "client_secret": CLIENT_SECRET or "",
+            "redirect_uris": [REDIRECT_URI or ""],
         }
     }
-    # Pass both redirect and state so the callback Flow matches the initial one
-    return Flow.from_client_config(
-        client_config,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        state=state,
-    )
-
+    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI or "", state=state)
 
 def get_creds():
     if "creds_json" in st.session_state:
         return Credentials.from_authorized_user_info(json.loads(st.session_state["creds_json"]), SCOPES)
     return None
 
-
 def store_creds(creds: Credentials):
     st.session_state["creds_json"] = creds.to_json()
 
-
-# ---------------------------------------------------------------------------
-# 1a) OAUTH SETUP CHECKER — prevents Error 400: invalid_request
-# ---------------------------------------------------------------------------
-
 def oauth_setup_checker():
-    """Static checks to catch redirect/client mistakes before hitting Google."""
-    issues: list[str] = []
-    tips: list[str] = []
-
+    issues, tips = [], []
     if not CLIENT_ID or not CLIENT_SECRET:
         issues.append("Missing CLIENT_ID or CLIENT_SECRET in st.secrets['google_oauth'].")
     if not REDIRECT_URI:
-        issues.append("Missing REDIRECT_URI (set redirect_uri_local / redirect_uri_prod in secrets).")
+        issues.append("Missing REDIRECT_URI (set redirect_uri_local / redirect_uri_prod).")
     else:
         if not REDIRECT_URI.startswith(("http://", "https://")):
             issues.append("REDIRECT_URI must start with http:// or https://")
-        if "streamlit.app" in REDIRECT_URI and not REDIRECT_URI.endswith("/"):
-            tips.append("For Streamlit Cloud, use a trailing slash, e.g., https://your-app.streamlit.app/ ")
-        if "localhost" in REDIRECT_URI:
-            if not REDIRECT_URI.startswith("http://"):
-                tips.append("For localhost, use http:// (not https://) and include the exact port, e.g., http://localhost:8501/")
-        if REDIRECT_URI.endswith("/") is False:
-            tips.append("Ensure the exact trailing slash matches what you registered in GCP.")
+        if "localhost" in REDIRECT_URI and not REDIRECT_URI.startswith("http://"):
+            tips.append("For localhost, use http:// and include the exact port (e.g., http://localhost:8501/)")
+        if not REDIRECT_URI.endswith("/"):
+            tips.append("Ensure trailing slash matches GCP OAuth settings.")
+    with st.expander("🔧 OAuth Setup Checker", expanded=False):
+        st.code({"ENV": ENV, "CLIENT_ID_suffix": (CLIENT_ID or "")[-12:], "REDIRECT_URI": REDIRECT_URI, "SCOPES": SCOPES}, language="json")
+        if issues: st.error("\n".join(f"• {i}" for i in issues))
+        if tips:   st.info("\n".join(f"• {t}" for t in tips))
+    return not issues
 
-    tips.append("In Google Cloud Console › Credentials, the OAuth client type must be **Web application**. Desktop/Other will 400.")
-    tips.append("Authorized redirect URIs must include this exact REDIRECT_URI (case, scheme, host, path, and trailing slash).")
-
-    with st.expander("🔧 OAuth Setup Checker (click to verify before Sign in)", expanded=False):
-        st.code(
-            {
-                "ENV": ENV,
-                "CLIENT_ID_suffix": CLIENT_ID[-12:] if CLIENT_ID else None,
-                "REDIRECT_URI": REDIRECT_URI,
-                "SCOPES": SCOPES,
-            },
-            language="json",
-        )
-        if issues:
-            st.error("\n".join(f"• {i}" for i in issues))
-        if tips:
-            st.info("\n".join(f"• {t}" for t in tips))
-
-    return not issues  # True if basic setup looks OK
-
-# OAuth: refresh if possible
+# Try refresh
 creds = get_creds()
 if creds and not creds.valid and creds.refresh_token:
     try:
@@ -185,102 +154,58 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
 
     # Guard: if the state doesn't match, stop to avoid CSRF & invalid_grant
     if saved_state and returned_state != saved_state:
-        st.error("OAuth state mismatch. Please retry sign-in. If this repeats, clear cookies and ensure only one app tab is open.")
-        st.stop()
-
+        st.error("OAuth state mismatch. Please retry."); st.stop()
     flow = build_flow(state=saved_state)
     try:
-        # Use the code we just received
         flow.fetch_token(code=params["code"])
     except (MismatchingStateError, InvalidRequestError):
-        st.error("OAuth state/parameters invalid during token exchange. Retry sign-in.")
-        st.stop()
+        st.error("OAuth parameters invalid. Retry sign-in."); st.stop()
     except (InvalidClientError, InvalidGrantError) as e:  # pragma: no cover
-        # Purposefully concise but actionable diagnostics
-        st.error(
-            "Google rejected the OAuth exchange (invalid_grant). Common causes: redirect URI mismatch, reused/expired code, or clock skew.")
-        with st.expander("Debug details"):
-            st.write({
-                "ENV": ENV,
-                "REDIRECT_URI": REDIRECT_URI,
-                "query_state": returned_state,
-                "saved_state": saved_state,
-                "hint": "Ensure this REDIRECT_URI is registered in Google Cloud Console > OAuth consent screen > Credentials > Authorized redirect URIs.",
-            })
+        st.error("Google rejected the OAuth exchange. Check redirect URI and retry.")
         st.stop()
-
     creds = flow.credentials
     store_creds(creds)
     st.query_params.clear()
-    st.success("Signed in to Google successfully.")
+    st.success("Signed in.")
     st.rerun()
 
 # Auth gate
 if not creds or not creds.valid:
-    # Show setup checker to pre-empt invalid_request before opening Google
     oauth_setup_checker()
-
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes='true',  # bool here, library formats as needed
+        include_granted_scopes=True,  # WHY: actual boolean (not string)
         prompt="consent",
     )
     # Persist state so the callback can verify it and rebuild Flow
     st.session_state["oauth_state"] = state
-
-    st.link_button(
-        "🔐 Sign in with Google",
-        auth_url,
-        help="Authorize Gmail & Sheets. We only act on your behalf.",
-        use_container_width=True,
-    )
+    st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
     st.stop()
 
+# --- Inputs -----------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# 2) INPUT CONTROLS
-# ---------------------------------------------------------------------------
-
-sheet_url = st.text_input(
-    "Google Sheet URL",
-    placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxxxxxxxxxx/edit#gid=0",
-    help="Make sure it's a real Google Sheet (not an uploaded Excel). If it's an .xlsx in Drive, open it and File → Save as Google Sheets."
-)
+sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxx/edit#gid=0")
 gmail_query = st.text_input(
     "Gmail search query",
     value='PAYLEMAIYAN subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
-    help="Use Gmail operators (is:unread, after:, before:). Narrow the window to reduce quota usage."
+    help="Use Gmail operators (is:unread, after:, before:) to narrow results."
 )
 
 c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1])
-with c1:
-    mark_read = st.checkbox("Mark processed as Read", value=True, help="Remove UNREAD label after logging a payment.")
-with c2:
-    throttle_ms = st.number_input("Throttle (ms) between writes", min_value=0, value=200, step=50, help="Delay to avoid 429s.")
-with c3:
-    max_results = st.number_input("Max messages to scan", min_value=10, max_value=1000, value=200, step=10)
-with c4:
-    weekly_auto = st.checkbox("Enable weekly automation", value=False, help="Runs Mondays 09:00 EAT while the app is open.")
-with c5:
-    verbose_debug = st.checkbox("Verbose debug", value=True, help="Collect step-by-step notes from bot_logic for troubleshooting.")
-with c6:
-    create_if_missing = st.checkbox("Auto-create tenant tabs", value=True, help="If a tab isn't found for an AccountCode, create it.")
-
+with c1: mark_read = st.checkbox("Mark processed as Read", value=True)
+with c2: throttle_ms = st.number_input("Throttle (ms) between writes", min_value=0, value=200, step=50)
+with c3: max_results = st.number_input("Max messages to scan", min_value=10, max_value=1000, value=200, step=10)
+with c4: weekly_auto = st.checkbox("Enable weekly automation", value=False)
+with c5: verbose_debug = st.checkbox("Verbose debug", value=True)
+with c6: create_if_missing = st.checkbox("Auto-create tenant tabs", value=True)
 run_now = st.button("▶️ Run Bot Now", type="primary", use_container_width=True)
-st.caption("Automation only runs while the app is open. We never run unattended without your checkbox enabled.")
 
-# ---------------------------------------------------------------------------
-# 3) HELPERS FOR GMAIL + SHEETS
-# ---------------------------------------------------------------------------
+# --- Helpers ----------------------------------------------------------------
 
 def extract_sheet_id(url: str) -> str:
-    """Extract the spreadsheet ID from a Drive URL."""
-    try:
-        return url.split("/d/")[1].split("/")[0]
-    except Exception:
-        return ""
+    try: return url.split("/d/")[1].split("/")[0]
+    except Exception: return ""
 
 def _decode_base64url(data: str) -> str:
     """Decode base64url Gmail parts safely (padding fixed)."""
@@ -311,12 +236,9 @@ def get_message_text(service, msg_id):
             body_texts.append(_decode_base64url(data))
         elif mime == "text/html" and data and not body_texts:
             body_texts.append(_strip_html(_decode_base64url(data)))
-        for p in parts or []:
-            walk(p)
-    walk(payload)
-    if body_texts:
-        return "\n".join(body_texts)
-    return msg.get("snippet", "")
+        for p in parts or []: walk(p)
+    walk(payload or {})
+    return "\n".join(body_texts) if body_texts else msg.get("snippet", "")
 
 def with_backoff(fn, *args, **kwargs):
     """Backoff wrapper for Sheets operations (append_rows, update, etc.)."""
@@ -348,13 +270,11 @@ def should_auto_run():
         return True
     return False
 
-# ---------------------------------------------------------------------------
-# 4) MAIN RUN
-# ---------------------------------------------------------------------------
+# --- Main run ---------------------------------------------------------------
 
 auto_trigger = should_auto_run()
 if auto_trigger:
-    st.info("🤖 Weekly automation window detected — running now.")
+    st.info("🤖 Weekly automation window detected — running.")
 run_now = run_now or auto_trigger
 
 if run_now:
@@ -376,10 +296,9 @@ if run_now:
     try:
         sh = gs.open_by_key(sheet_id)
     except Exception as e:
-        st.error(f"Could not open the Google Sheet. Ensure you own it or have edit access.\n\n{e}")
+        st.error(f"Could not open the Google Sheet. Ensure edit access.\n\n{e}")
         st.stop()
 
-    # Ensure meta sheets exist
     def ensure_meta(ws_name, header):
         try:
             ws = sh.worksheet(ws_name)
@@ -388,7 +307,8 @@ if run_now:
             with_backoff(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
         return ws
 
-    refs_ws = ensure_meta("ProcessedRefs", ["Ref"])
+    # Headers aligned to workbook
+    refs_ws = ensure_meta("ProcessedRefs", ["Refs"])  # WHY: matches workbook
     hist_ws = ensure_meta("PaymentHistory", PAYMENT_COLS + ['AccountCode','TenantSheet','Month'])
 
     # Load processed refs to avoid duplicates
@@ -406,18 +326,15 @@ if run_now:
     for m in messages:
         try:
             text = get_message_text(gmail, m["id"])
-
-            if "PAYLEMAIYAN" not in text.upper():
+            if "PAYLEMAIYAN" not in (text or "").upper():
                 continue
-
             pay = parse_email(text)
             if not pay:
                 errors.append(f"Could not parse message id {m['id']}")
                 continue
             ref_norm = (pay.get('REF Number','') or '').upper()
             if ref_norm in processed_refs:
-                # skip duplicates
-                continue
+                continue  # WHY: idempotent writes by REF
             parsed.append((m["id"], pay))
         except Exception as e:
             errors.append(f"Error reading message {m['id']}: {e}")
@@ -426,6 +343,7 @@ if run_now:
 
     # Find/create tenant worksheet by AccountCode (prefix match)
     worksheets = {ws.title: ws for ws in sh.worksheets()}
+
     def find_or_create_tenant_sheet(account_code: str):
         acct = (account_code or '').strip().upper()
         for title, ws in worksheets.items():
@@ -437,12 +355,11 @@ if run_now:
         # Create with header on row 7 (matches your schema)
         title = f"{account_code} - AutoAdded"
         ws = sh.add_worksheet(title=title, rows=2000, cols=20)
-        hdr = ['Month','Amount Due','Amount paid','Date paid','REF Number','Date due','Prepayment/Arrears','Penalties','Comments']
+        # Canonical header (row 7) — WHY: matches logic aliasing and keeps uniform
+        hdr = ['Month','Date Due','Amount Due','Amount Paid','Date Paid','REF Number','Comments','Prepayment/Arrears','Penalties']
         with_backoff(ws.update, "7:7", [hdr], value_input_option="USER_ENTERED")
-        try:
-            ws.freeze(rows=7)
-        except Exception:
-            pass
+        try: ws.freeze(rows=7)
+        except Exception: pass
         worksheets[title] = ws
         st.info(f"➕ Created tenant sheet: {title}")
         return ws
@@ -455,17 +372,13 @@ if run_now:
         ws = find_or_create_tenant_sheet(p["AccountCode"])
         info = update_tenant_month_row(ws, p, debug_accum)
 
-        logs.append(
-            f"🧾 {info.get('sheet')} R{info.get('row')} | {info.get('month')} | "
-            f"Paid {info.get('paid_before')}→{info.get('paid_after')} | Ref {p.get('REF Number')}"
-        )
+        logs.append(f"🧾 {info.get('sheet')} R{info.get('row')} | {info.get('month')} | Paid {info.get('paid_before')}→{info.get('paid_after')} | Ref {p.get('REF Number')}")
 
-        # Append to history (for metrics)
-        dt = datetime.strptime(p["Date Paid"], "%d/%m/%Y %I:%M %p")
-        mon = dt.strftime("%Y-%m")
-        hist_rows.append([p[k] for k in PAYMENT_COLS] + [p['AccountCode'], ws.title, mon])
+        # Append to history using aligned schema; preserve extras at end
+        hist_rows.append([p.get(k, "") for k in PAYMENT_COLS] + [
+            p.get('AccountCode',''), ws.title, datetime.strptime(p["Date Paid"], "%d/%m/%Y").strftime("%Y-%m")
+        ])
 
-        # Mark ref as processed
         ref_val = (p.get("REF Number","") or "").upper()
         ref_rows.append([ref_val])
         processed_refs.add(ref_val)
@@ -477,32 +390,23 @@ if run_now:
             except Exception:
                 pass
 
-        # Throttle to be gentle with API quotas
-        if throttle_ms > 0:
-            time.sleep(throttle_ms / 1000.0)
+        if throttle_ms > 0: time.sleep(throttle_ms / 1000.0)
 
-        # Flush batches periodically
+        # Flush in batches
         if len(hist_rows) >= 100 or idx == len(parsed):
-            with_backoff(hist_ws.append_rows, hist_rows, value_input_option="USER_ENTERED")
-            hist_rows.clear()
-            with_backoff(refs_ws.append_rows, ref_rows, value_input_option="RAW")
-            ref_rows.clear()
+            with_backoff(hist_ws.append_rows, hist_rows, value_input_option="USER_ENTERED"); hist_rows.clear()
+            with_backoff(refs_ws.append_rows, ref_rows, value_input_option="RAW"); ref_rows.clear()
 
     # Run results
     st.success("Ingestion complete.")
     st.subheader("Run Log")
-    if logs:
-        st.code("\n".join(logs), language="text")
+    if logs: st.code("\n".join(logs), language="text")
     if errors:
-        st.subheader("Non-fatal Parse/Read Errors")
-        st.code("\n".join(errors), language="text")
+        st.subheader("Non-fatal Parse/Read Errors"); st.code("\n".join(errors), language="text")
     if debug_accum:
-        st.subheader("Verbose Debug (bot_logic)")
-        st.code("\n".join(debug_accum), language="text")
+        st.subheader("Verbose Debug (bot_logic)"); st.code("\n".join(debug_accum), language="text")
 
-    # -----------------------------------------------------------------------
-    # METRICS
-    # -----------------------------------------------------------------------
+    # --- Metrics -------------------------------------------------------------
     st.subheader("📊 Portfolio Metrics")
 
     # PaymentHistory aggregates
@@ -514,30 +418,26 @@ if run_now:
             df_hist[col] = pd.to_numeric(df_hist[col], errors="coerce").fillna(0.0)
         this_month = datetime.now().strftime("%Y-%m")
         income_this_month = float(df_hist.loc[df_hist["Month"] == this_month, "Amount Paid"].sum())
-        grouped = df_hist.groupby("Month", dropna=False).agg(
-            Payments=("REF Number","count"),
-            TotalAmount=("Amount Paid","sum")
-        ).reset_index().sort_values("Month")
+        grouped = df_hist.groupby("Month", dropna=False).agg(Payments=("REF Number","count"), TotalAmount=("Amount Paid","sum")).reset_index().sort_values("Month")
         st.markdown("**Payment History — by Month**")
         st.dataframe(grouped, use_container_width=True)
 
     # Per-tenant balances & penalties (scan each tenant tab)
+
     total_prepay = 0.0
     total_arrears = 0.0
     penalty_freq = {}
+
     def parse_float(x):
-        try:
-            return float(str(x).replace(",", "").strip())
-        except Exception:
-            return 0.0
+        try: return float(str(x).replace(",", "").strip())
+        except Exception: return 0.0
 
     def detect_header_row(all_vals, scan_rows: int = 30) -> int:
-        # Lightweight detector for metrics-only purposes
+        # Lightweight in-app variant
         def score(row):
             s = 0
             for cell in row:
                 t = str(cell or "").strip().lower()
-                if not t: continue
                 if t in {"month","amount due","amount paid","date paid","ref number","date due","prepayment/arrears","penalties","comments"}:
                     s += 1
             return s
@@ -545,8 +445,7 @@ if run_now:
         limit = min(len(all_vals), max(1, scan_rows))
         for i in range(limit):
             sc = score(all_vals[i])
-            if sc > best_score:
-                best_i, best_score = i, sc
+            if sc > best_score: best_i, best_score = i, sc
         return best_i if best_score >= 3 else 0
 
     for ws in sh.worksheets():
@@ -574,9 +473,10 @@ if run_now:
             for r in reversed(rows):
                 if i_mon != -1 and len(r) > i_mon and str(r[i_mon]).strip():
                     latest_row = r; break
-            if latest_row is None: latest_row = rows[-1]
+            if latest_row is None and rows:
+                latest_row = rows[-1]
 
-            if i_bal != -1 and len(latest_row) > i_bal:
+            if latest_row and i_bal != -1 and len(latest_row) > i_bal:
                 bal = parse_float(latest_row[i_bal])
                 if bal > 0: total_prepay += bal
                 elif bal < 0: total_arrears += abs(bal)
