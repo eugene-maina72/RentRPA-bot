@@ -5,9 +5,9 @@ import re
 import pandas as pd
 from pathlib import Path
 from mock_gspread import MockWorksheet
-import bot_logic as bl
+import test_logic as bl
 
-WB = Path("RENT TRACKING-Lemaiyan Heights test.xlsx")
+WB = Path("tests/RENT TRACKING-Lemaiyan Heights test.xlsx")
 
 def load_ws(name):
     df = pd.read_excel(WB, sheet_name=name, header=None)
