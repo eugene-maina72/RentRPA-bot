@@ -47,7 +47,7 @@ st.set_page_config(page_title="Rent RPA (Gmail → Sheets)", page_icon="🏠", l
 st.title("🏠 Rent RPA — Gmail → Google Sheets")
 st.markdown(
     """
-<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#f7f5f4;margin-bottom:8px">
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#8777f7d;margin-bottom:8px">
 <b>Rules:</b> Date due = <b>5th</b>. <b>Penalty</b> = 3000 KES if paid <i>after</i> due + 2 days and balance is negative.<br>
 <b>Safety:</b> We append missing headers; never overwrite <b>Comments</b>.
 </div>
