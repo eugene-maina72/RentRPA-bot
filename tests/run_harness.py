@@ -4,10 +4,10 @@
 import pandas as pd
 from pathlib import Path
 import re
-from mock_gspread import MockWorksheet
-import test_logic as bl
+from tests.mock_gspread import MockWorksheet
+import tests.test_logic as bl
 
-WB = Path("RENT TRACKING-Lemaiyan Heights test.xlsx")
+WB = Path("tests/RENT TRACKING-Lemaiyan Heights test.xlsx")
 
 def load_ws(sheet_name: str):
     df = pd.read_excel(WB, sheet_name=sheet_name, header=None)
