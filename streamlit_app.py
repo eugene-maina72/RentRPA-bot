@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-streamlit_app.py — RentRPA Streamlit UI
-
-What this app does
-------------------
-- Authenticates to Google via OAuth (Gmail + Sheets scopes).
-- Searches Gmail for payment alerts, parses them, and de-duplicates by REF.
-- For each parsed payment, finds the matching tenant tab and updates the correct month row
-  using `bot_logic.update_tenant_month_row` (which is header-row aware and non-destructive).
-- Writes a clean PaymentHistory and ProcessedRefs to help with metrics and avoiding duplicates.
-- Shows portfolio metrics (income this month, total prepayments/arrears, penalty frequency).
-- Optional weekly automation (opt-in checkbox) runs Mondays 09:00 EAT *while the app is open*.
-
-Key UX / Safety details
------------------------
-- The app never renames user headers or deletes columns/rows. It adds missing canonical columns to the far right.
-- It assumes Date Due is always the 5th of the month, and computes Penalties + Prepayment/Arrears accordingly.
-- The Comments column is never overwritten; new rows get "None" for Comments so a human can fill it in later.
-"""
 
 """
 Streamlit UI to ingest NCBA emails → Google Sheets.
