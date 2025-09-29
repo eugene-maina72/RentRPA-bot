@@ -4,7 +4,7 @@
 import re
 import pandas as pd
 from pathlib import Path
-from tests.mock_gspread import MockWorksheet
+from mock_gspread import MockWorksheet
 import bot_logic as bl
 
 WB = Path("RENT TRACKING-Lemaiyan Heights test.xlsx")

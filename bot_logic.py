@@ -263,7 +263,11 @@ def _sort_by_monthkey(ws, header_row0: int, header: list[str], colmap: dict):
         mk_idx = [h.strip().lower() for h in header].index("monthkey")
     except ValueError:
         return
-    ws.sort((mk_idx+1, 'asc'))  # WHY: sheets-native sort
+    try:
+        ws.sort((mk_idx+1, 'asc'))  # best-effort; Google sometimes 500s here
+    except Exception:
+        # keep going; sorting is cosmetic and not worth aborting the run
+        pass
 
 # --- Conditional formatting: arrears/penalties highlights --------------------
 
