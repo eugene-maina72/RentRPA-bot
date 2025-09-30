@@ -1,15 +1,19 @@
-# streamlit_app.py
+# /streamlit_app.py
 # -*- coding: utf-8 -*-
-
 """
 Streamlit UI to ingest NCBA emails → Google Sheets.
 
-WHY these choices:
-- Safe OAuth flow & checker: avoids hard-crash when secrets missing.
-- Robust Gmail parsing with throttling & dedupe by REF.
-- History writes align with workbook header; tolerant to missing fields.
-- Optional tenant tab auto-create with canonical headers.
-- Portfolio metrics computed from PaymentHistory + per-tenant balances.
+WHY:
+- Safe OAuth, throttled Gmail/Sheets.
+- Robust parser, schema alignment, idempotent by REF.
+- Business rules:
+    * Rent due = 5th.
+    * Penalty = 3000 if (DatePaid >= DateDue + 2) AND (net_after <= 0).
+- Defensive formulas (no #VALUE!).
+- MonthKey for stable sorting (quota-friendly per-row set).
+- Maintenance tools:
+    * Backfill MonthKey (throttled).
+    * NEW: Migration/Repair — rewrite formulas for all rows and optionally backfill MonthKey.
 """
 
 import json, time, base64, re
@@ -24,7 +28,6 @@ from google.auth.transport.requests import Request
 import gspread
 from gspread.exceptions import APIError
 
-# Extra: capture common OAuth errors to show helpful guidance
 try:
     from oauthlib.oauth2.rfc6749.errors import (
         InvalidGrantError, MismatchingStateError, InvalidClientError, InvalidRequestError,
@@ -36,29 +39,26 @@ from bot_logic import (
     parse_email,
     update_tenant_month_row,
     PAYMENT_COLS,
-    clear_cache
+    clear_cache,
+    _parse_month_cell,  # internal helper reuse is fine
 )
 
-# ---------------------------------------------------------------------------
-# 0) PAGE CHROME + TOP HELP
-# ---------------------------------------------------------------------------
+# --- Page & config -----------------------------------------------------------
 
 st.set_page_config(page_title="Rent RPA (Gmail → Sheets)", page_icon="🏠", layout="wide")
 st.title("🏠 Rent RPA — Gmail → Google Sheets")
 st.markdown(
     """
-<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#8777f7d;margin-bottom:8px">
-<b>Rules:</b> Date due = <b>5th</b>. <b>Penalty</b> = 3000 KES if paid <i>after</i> due + 2 days and balance is negative.<br>
-<b>Safety:</b> We append missing headers; never overwrite <b>Comments</b>.
+<div style="padding:10px;border:1px solid #ddd;border-radius:8px;background:#f7f5f4;margin-bottom:8px">
+<b>Rules:</b> Date due = <b>5th</b>. <b>Penalty</b> = 3000 KES if paid on/after <i>due + 2</i> and balance ≤ 0.<br>
+<b>Safety:</b> We append missing headers; never overwrite <b>Comments</b>. Defensive formulas prevent #VALUE!.
 </div>
 """,
     unsafe_allow_html=True,
 )
 st.caption("Tokens live only in your session memory. No server-side persistence.")
 
-# ---------------------------------------------------------------------------
-# 1) OAUTH CONFIG — lenient and debug-friendly
-# ---------------------------------------------------------------------------
+# --- OAuth -------------------------------------------------------------------
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -76,10 +76,7 @@ REDIRECT_PROD  = GOOGLE_OAUTH.get("redirect_uri_prod")
 REDIRECT_URI   = REDIRECT_PROD if ENV == "prod" else REDIRECT_LOCAL
 
 def build_flow(state: str | None = None) -> Flow:
-    """Create an OAuth 2.0 Flow; `state` is persisted across the auth dance.
-    Why: Google checks `state` to prevent CSRF — mismatches raise InvalidGrant.
-    """
-    client_config = {
+    cfg = {
         "web": {
             "client_id": CLIENT_ID or "",
             "project_id": "rent-rpa",
@@ -90,7 +87,7 @@ def build_flow(state: str | None = None) -> Flow:
             "redirect_uris": [REDIRECT_URI or ""],
         }
     }
-    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI or "", state=state)
+    return Flow.from_client_config(cfg, scopes=SCOPES, redirect_uri=REDIRECT_URI or "", state=state)
 
 def get_creds():
     if "creds_json" in st.session_state:
@@ -112,7 +109,7 @@ def oauth_setup_checker():
         if "localhost" in REDIRECT_URI and not REDIRECT_URI.startswith("http://"):
             tips.append("For localhost, use http:// and include the exact port (e.g., http://localhost:8501/)")
         if not REDIRECT_URI.endswith("/"):
-            tips.append("Ensure trailing slash matches GCP OAuth settings.")
+            tips.append("Ensure trailing slash matches GCP OAuth.")
     with st.expander("🔧 OAuth Setup Checker", expanded=False):
         st.code({"ENV": ENV, "CLIENT_ID_suffix": (CLIENT_ID or "")[-12:], "REDIRECT_URI": REDIRECT_URI, "SCOPES": SCOPES}, language="json")
         if issues: st.error("\n".join(f"• {i}" for i in issues))
@@ -125,26 +122,20 @@ if creds and not creds.valid and creds.refresh_token:
     try:
         creds.refresh(Request()); store_creds(creds)
     except Exception:
-        # Why: refresh_token can be revoked or expired; force re-auth cleanly.
         creds = None
 
 # OAuth callback
 params = st.query_params
 if "code" in params and "state" in params and "creds_json" not in st.session_state:
-    returned_state = params.get("state")
-    saved_state = st.session_state.get("oauth_state")
-
-    # Guard: if the state doesn't match, stop to avoid CSRF & invalid_grant
-    if saved_state and returned_state != saved_state:
+    if st.session_state.get("oauth_state") and params.get("state") != st.session_state["oauth_state"]:
         st.error("OAuth state mismatch. Please retry."); st.stop()
-    flow = build_flow(state=saved_state)
+    flow = build_flow(state=st.session_state.get("oauth_state"))
     try:
         flow.fetch_token(code=params["code"])
     except (MismatchingStateError, InvalidRequestError):
         st.error("OAuth parameters invalid. Retry sign-in."); st.stop()
-    except (InvalidClientError, InvalidGrantError) as e:  # pragma: no cover
-        st.error("Google rejected the OAuth exchange. Check redirect URI and retry.")
-        st.stop()
+    except (InvalidClientError, InvalidGrantError):  # pragma: no cover
+        st.error("Google rejected the OAuth exchange. Check redirect URI and retry."); st.stop()
     creds = flow.credentials
     store_creds(creds)
     st.query_params.clear()
@@ -155,23 +146,17 @@ if "code" in params and "state" in params and "creds_json" not in st.session_sta
 if not creds or not creds.valid:
     oauth_setup_checker()
     flow = build_flow()
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",  # WHY: actual boolean (not string)
-        prompt="consent",
-    )
-    # Persist state so the callback can verify it and rebuild Flow
+    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes=True, prompt="consent")
     st.session_state["oauth_state"] = state
     st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
     st.stop()
 
-# --- Inputs -----------------------------------------------------------------
+# --- Inputs ------------------------------------------------------------------
 
 sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxx/edit#gid=0")
 gmail_query = st.text_input(
     "Gmail search query",
     value='PAYLEMAIYAN subject:"NCBA TRANSACTIONS STATUS UPDATE" newer_than:365d',
-    help="Use Gmail operators (is:unread, after:, before:) to narrow results."
 )
 
 c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1])
@@ -183,7 +168,7 @@ with c5: verbose_debug = st.checkbox("Verbose debug", value=True)
 with c6: create_if_missing = st.checkbox("Auto-create tenant tabs", value=True)
 run_now = st.button("▶️ Run Bot Now", type="primary", use_container_width=True)
 
-# --- Helpers ----------------------------------------------------------------
+# --- Helpers -----------------------------------------------------------------
 
 def extract_sheet_id(url: str) -> str:
     try: return url.split("/d/")[1].split("/")[0]
@@ -223,7 +208,6 @@ def get_message_text(service, msg_id):
     return "\n".join(body_texts) if body_texts else msg.get("snippet", "")
 
 def with_backoff(fn, *args, **kwargs):
-    """Backoff wrapper for Sheets operations (append_rows, update, etc.)."""
     delay = 1.0
     for _ in range(6):
         try:
@@ -237,12 +221,231 @@ def with_backoff(fn, *args, **kwargs):
                 time.sleep(delay); delay *= 2; continue
             raise
 
+def _detect_header_row(all_vals, scan_rows: int = 30) -> int:
+    def score(row):
+        s = 0
+        for cell in row:
+            t = str(cell or "").strip().lower()
+            if t in {"month","amount due","amount paid","date paid","ref number","date due","prepayment/arrears","penalties","comments","monthkey"}:
+                s += 1
+        return s
+    best_i, best_score = 0, 0
+    limit = min(len(all_vals), max(1, scan_rows))
+    for i in range(limit):
+        sc = score(all_vals[i])
+        if sc > best_score: best_i, best_score = i, sc
+    return best_i if best_score >= 3 else 0
+
+# --- Maintenance: MonthKey Backfill (existing) & NEW Migration/Repair --------
+
+st.divider()
+with st.expander("🧰 Maintenance", expanded=False):
+    st.markdown("**Run these one-time (or occasionally) to repair legacy rows and keep sorting stable.**")
+
+    # MonthKey backfill (existing tool)
+    colA, colB = st.columns([1,1])
+    with colA:
+        backfill_chunk = st.number_input("MonthKey chunk size", min_value=10, max_value=500, value=50, step=10)
+    with colB:
+        backfill_delay = st.number_input("Delay (seconds) between MonthKey batches", min_value=0.0, max_value=5.0, value=0.75, step=0.25)
+
+    do_backfill = st.button("🛠 Backfill MonthKey (maintenance)", use_container_width=True)
+
+    # NEW: Migration / Repair formulas
+    st.markdown("---")
+    colC, colD, colE = st.columns([1,1,2])
+    with colC:
+        mig_chunk = st.number_input("Repair chunk size", min_value=10, max_value=500, value=75, step=5,
+                                    help="Cells per batch update (Penalties & Balance).")
+    with colD:
+        mig_delay = st.number_input("Delay (seconds) between repair batches", min_value=0.0, max_value=5.0, value=0.5, step=0.25)
+    with colE:
+        mig_backfill_mkey = st.checkbox("Also backfill MonthKey during repair", value=True)
+
+    do_migrate = st.button("🔧 Repair Formulas (migration)", use_container_width=True)
+
+    # Common sheet open
+    if (do_backfill or do_migrate):
+        if not sheet_url:
+            st.error("Please paste your Google Sheet URL above."); st.stop()
+        sheet_id = extract_sheet_id(sheet_url)
+        if not sheet_id:
+            st.error("That doesn't look like a valid Google Sheet URL."); st.stop()
+
+        gs = gspread.authorize(creds)
+        try:
+            sh = gs.open_by_key(sheet_id)
+        except Exception as e:
+            st.error(f"Could not open the Google Sheet. Ensure edit access.\n\n{e}")
+            st.stop()
+
+    # --- Backfill MonthKey action
+    if do_backfill:
+        ws_list = [ws for ws in sh.worksheets() if ws.title not in ("PaymentHistory","ProcessedRefs")]
+        pbar = st.progress(0, text="Scanning sheets...")
+        total_candidates = total_updated = total_skipped = touched_sheets = 0
+
+        for idx, ws in enumerate(ws_list, start=1):
+            try:
+                vals = with_backoff(ws.get_all_values)
+                if not vals:
+                    pbar.progress(idx / len(ws_list), text=f"Skipping empty: {ws.title}")
+                    continue
+                header_row0 = _detect_header_row(vals)
+                header = [c.strip() for c in vals[header_row0]]
+
+                # Ensure MonthKey
+                norm = [h.strip().lower() for h in header]
+                if "monthkey" not in norm:
+                    header.append("MonthKey")
+                    with_backoff(ws.update, f"{header_row0+1}:{header_row0+1}", [header], value_input_option="USER_ENTERED")
+                    norm = [h.strip().lower() for h in header]
+                i_month = [h.lower() for h in header].index("month")
+                i_mkey  = [h.lower() for h in header].index("monthkey")
+
+                rows = vals[header_row0+1:]
+                updates = []
+                for r_pos, row in enumerate(rows, start=header_row0+2):
+                    month_txt = row[i_month] if len(row) > i_month else ""
+                    mkey_txt  = row[i_mkey]  if len(row) > i_mkey  else ""
+                    if mkey_txt: continue
+                    ym = _parse_month_cell(month_txt)
+                    if not ym:
+                        total_skipped += 1; continue
+                    y, m = ym
+                    a1 = gspread.utils.rowcol_to_a1(r_pos, i_mkey+1)
+                    updates.append({"range": a1, "values": [[f"{y:04d}-{m:02d}"]]})
+
+                total_candidates += len(updates)
+                if updates:
+                    touched_sheets += 1
+                    for j in range(0, len(updates), int(backfill_chunk)):
+                        batch = updates[j:j+int(backfill_chunk)]
+                        with_backoff(ws.batch_update, batch, value_input_option="USER_ENTERED")
+                        total_updated += len(batch)
+                        time.sleep(float(backfill_delay))
+                pbar.progress(idx / len(ws_list), text=f"Processed {ws.title}")
+
+            except Exception as e:
+                pbar.progress(idx / len(ws_list), text=f"Error on {ws.title}: {e}")
+                continue
+
+        st.success(f"MonthKey Backfill: Sheets touched={touched_sheets} | Written={total_updated} | Skipped invalid={total_skipped} | Candidates={total_candidates}")
+
+    # --- Migration/Repair action
+    if do_migrate:
+        ws_list = [ws for ws in sh.worksheets() if ws.title not in ("PaymentHistory","ProcessedRefs")]
+        pbar = st.progress(0, text="Rewriting formulas…")
+        total_pen = total_bal = total_mk = 0
+        touched_sheets = 0
+        errors = []
+
+        for idx, ws in enumerate(ws_list, start=1):
+            try:
+                vals = with_backoff(ws.get_all_values)
+                if not vals:
+                    pbar.progress(idx/len(ws_list), text=f"Skipping empty: {ws.title}")
+                    continue
+
+                header_row0 = _detect_header_row(vals)
+                header = [c.strip() for c in vals[header_row0]]
+                hl = [h.strip().lower() for h in header]
+
+                # Minimal required columns
+                def col(name): return hl.index(name)
+                try:
+                    i_mon = col("month"); i_due = col("amount due"); i_paid = col("amount paid")
+                    i_dp  = col("date paid"); i_dd = col("date due")
+                    i_pen = col("penalties"); i_bal = col("prepayment/arrears")
+                except ValueError:
+                    pbar.progress(idx/len(ws_list), text=f"Missing core headers on {ws.title}; skipping")
+                    continue
+
+                # Ensure MonthKey column if requested
+                i_mkey = None
+                if mig_backfill_mkey:
+                    if "monthkey" not in hl:
+                        header.append("MonthKey")
+                        with_backoff(ws.update, f"{header_row0+1}:{header_row0+1}", [header], value_input_option="USER_ENTERED")
+                        hl = [h.strip().lower() for h in header]
+                    i_mkey = hl.index("monthkey")
+
+                rows = vals[header_row0+1:]
+                # Build updates
+                updates = []
+                mk_updates = []
+                for n, row in enumerate(rows, start=1):  # n=1 is first data row
+                    r_abs = header_row0 + 1 + n
+                    # A1 addresses
+                    ap = gspread.utils.rowcol_to_a1(r_abs, i_paid+1)
+                    ad = gspread.utils.rowcol_to_a1(r_abs, i_due+1)
+                    dp = gspread.utils.rowcol_to_a1(r_abs, i_dp+1)
+                    dd = gspread.utils.rowcol_to_a1(r_abs, i_dd+1)
+                    pe = gspread.utils.rowcol_to_a1(r_abs, i_pen+1)
+                    ba = gspread.utils.rowcol_to_a1(r_abs, i_bal+1)
+                    prev_ba = gspread.utils.rowcol_to_a1(r_abs-1, i_bal+1)
+
+                    # Defensive coercions
+                    paid_num = f"IFERROR(VALUE({ap}), N({ap}))"
+                    due_num  = f"IFERROR(VALUE({ad}), N({ad}))"
+                    prev_bal = f"IFERROR({prev_ba}, 0)"
+                    pen_num  = f"IFERROR({pe}, 0)"
+                    dpaid    = f"IFERROR(DATEVALUE(TO_TEXT({dp})), {dp})"
+                    ddue     = f"IFERROR(DATEVALUE(TO_TEXT({dd})), {dd})"
+                    hasp     = f"LEN(TO_TEXT({dp}))>0"
+                    hasd     = f"LEN(TO_TEXT({dd}))>0"
+                    net_after= f"({prev_bal}+{paid_num}-{due_num})"
+
+                    pen_formula = f"=IF(AND({hasp}, {hasd}, {net_after} <= 0, {dpaid} >= {ddue} + 2), 3000, 0)"
+                    if n == 1:
+                        bal_formula = f"=({paid_num})-({due_num})-({pen_num})"
+                    else:
+                        bal_formula = f"=({prev_bal})+({paid_num})-({due_num})-({pen_num})"
+
+                    updates.append({"range": pe, "values": [[pen_formula]]})
+                    updates.append({"range": ba, "values": [[bal_formula]]})
+                    total_pen += 1; total_bal += 1
+
+                    # MonthKey backfill per-row (if enabled)
+                    if mig_backfill_mkey:
+                        try:
+                            mon_txt = row[i_mon] if len(row) > i_mon else ""
+                            ym = _parse_month_cell(mon_txt)
+                            if ym:
+                                if i_mkey is not None:
+                                    mk_cell = gspread.utils.rowcol_to_a1(r_abs, i_mkey+1)
+                                    mk_updates.append({"range": mk_cell, "values": [[f"{ym[0]:04d}-{ym[1]:02d}"]]})
+                                    total_mk += 1
+                        except Exception:
+                            pass
+
+                # Throttled writes
+                def _emit(batches, chunk, delay):
+                    for j in range(0, len(batches), int(chunk)):
+                        batch = batches[j:j+int(chunk)]
+                        with_backoff(ws.batch_update, batch, value_input_option="USER_ENTERED")
+                        time.sleep(float(delay))
+
+                if updates:
+                    touched_sheets += 1
+                    _emit(updates, mig_chunk, mig_delay)
+                if mig_backfill_mkey and mk_updates:
+                    _emit(mk_updates, max(25, int(mig_chunk//2)), mig_delay)
+
+                pbar.progress(idx/len(ws_list), text=f"Repaired {ws.title}")
+
+            except Exception as e:
+                errors.append(f"{ws.title}: {e}")
+                pbar.progress(idx/len(ws_list), text=f"Error on {ws.title}: {e}")
+
+        st.success(f"Repair complete. Sheets touched={touched_sheets} | Penalties set={total_pen} | Balances set={total_bal} | MonthKeys set={total_mk}")
+        if errors:
+            st.warning("Some sheets had issues:")
+            st.code("\n".join(errors), language="text")
+
+# --- Main ingestion ----------------------------------------------------------
+
 def should_auto_run():
-    """
-    Weekly automation gate:
-    - Fires Mondays 09:00 EAT (UTC+3) when the app is open.
-    - Only once per week (tracked in session).
-    """
     if not weekly_auto: return False
     now_utc = datetime.utcnow()
     eat = now_utc + timedelta(hours=3)
@@ -260,10 +463,7 @@ if auto_trigger:
 run_now = run_now or auto_trigger
 
 if run_now:
-    # Reset bot_logic cache at the start of each run to avoid stale header/col counts
     clear_cache()
-
-    # Validate inputs
     if not sheet_url:
         st.error("Please paste your Google Sheet URL."); st.stop()
     sheet_id = extract_sheet_id(sheet_url)
@@ -289,8 +489,7 @@ if run_now:
             with_backoff(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
         return ws
 
-    # Headers aligned to workbook
-    refs_ws = ensure_meta("ProcessedRefs", ["Refs"])  # WHY: matches workbook
+    refs_ws = ensure_meta("ProcessedRefs", ["Refs"])
     hist_ws = ensure_meta("PaymentHistory", PAYMENT_COLS + ['AccountCode','TenantSheet','Month'])
 
     # Load processed refs to avoid duplicates
@@ -316,7 +515,7 @@ if run_now:
                 continue
             ref_norm = (pay.get('REF Number','') or '').upper()
             if ref_norm in processed_refs:
-                continue  # WHY: idempotent writes by REF
+                continue
             parsed.append((m["id"], pay))
         except Exception as e:
             errors.append(f"Error reading message {m['id']}: {e}")
@@ -414,22 +613,6 @@ if run_now:
         try: return float(str(x).replace(",", "").strip())
         except Exception: return 0.0
 
-    def detect_header_row(all_vals, scan_rows: int = 30) -> int:
-        # Lightweight in-app variant
-        def score(row):
-            s = 0
-            for cell in row:
-                t = str(cell or "").strip().lower()
-                if t in {"month","amount due","amount paid","date paid","ref number","date due","prepayment/arrears","penalties","comments"}:
-                    s += 1
-            return s
-        best_i, best_score = 0, 0
-        limit = min(len(all_vals), max(1, scan_rows))
-        for i in range(limit):
-            sc = score(all_vals[i])
-            if sc > best_score: best_i, best_score = i, sc
-        return best_i if best_score >= 3 else 0
-
     for ws in sh.worksheets():
         name = ws.title.upper()
         if name in ("PAYMENTHISTORY", "PROCESSEDREFS"):
@@ -437,7 +620,7 @@ if run_now:
         try:
             vals = with_backoff(ws.get_all_values)
             if not vals: continue
-            header_row0 = detect_header_row(vals)
+            header_row0 = _detect_header_row(vals)
             header = [c.strip() for c in vals[header_row0]]
             rows = vals[header_row0+1:]
             if not rows: continue

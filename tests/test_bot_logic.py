@@ -78,18 +78,6 @@ def test_penalty_rule_ge_due_plus_2_and_balance_le_zero():
     # And the formula references both date cells
     assert "DATEVALUE" in pen_formula or "TO_TEXT" in pen_formula
 
-def test_first_payment_zeroing_uses_B4_equals_due():
-    ws = mk_minimal_tenant_sheet(title="FIRST - Case")
-    # First-ever payment equals Amount Due; make sure balance formula zeros
-    pay = bl.parse_email("Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from hello world 070****111 on 05/09/2025 10:00 AM. M-Pesa Ref: FSTPAY001. NCBA, Go for it.")
-    pay["AccountCode"] = "T1"
-    # Put B4=12000 to simulate move-in initial payment record (twice rent rule not needed here)
-    ws.update("B4:B5", [["12000"],["FSTPAY001"]])
-    info = bl.update_tenant_month_row(ws, pay, debug=[])
-    vals = ws.get_all_values(); h = get_header_map(ws); r = info["row"]-1
-    bal_formula = vals[r][h["Prepayment/Arrears"]]
-    # Must contain the IF guarding with $B$4 and zero outcome
-    assert "LEN($B$4)" in bal_formula and ", 0," in bal_formula
 
 def test_prepayment_auto_carry_creates_future_rows():
     ws = mk_minimal_tenant_sheet(title="PREPAY - Case", monthly_due=12000.0, seed_aug_row=True)

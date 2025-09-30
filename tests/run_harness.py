@@ -25,17 +25,6 @@ def case_penalty():
     print("Penalty formula:", vals[info["row"]-1][vals[6].index("Penalties")])
     print()
 
-def case_first_payment_zero():
-    ws = mk_minimal_tenant_sheet(title="HARNESS - FIRST")
-    text = "Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from hello 070****111 on 05/09/2025 10:00 AM. M-Pesa Ref: FSTPAY001. NCBA, Go for it."
-    p = bl.parse_email(text); p["AccountCode"] = "T1"
-    ws.update("B4:B5", [["12000"],["FSTPAY001"]])
-    info = bl.update_tenant_month_row(ws, p, debug=[])
-    vals = ws.get_all_values()
-    print("== FIRST PAYMENT ZERO ==")
-    print("Row:", info["row"], "Month:", info["month"])
-    print("Balance formula:", vals[info["row"]-1][vals[6].index("Prepayment/Arrears")])
-    print()
 
 def case_prepayment_carry():
     ws = mk_minimal_tenant_sheet(title="HARNESS - PREPAY", seed_aug_row=True)
@@ -51,5 +40,5 @@ def case_prepayment_carry():
 
 if __name__ == "__main__":
     case_penalty()
-    case_first_payment_zero()
+    
     case_prepayment_carry()

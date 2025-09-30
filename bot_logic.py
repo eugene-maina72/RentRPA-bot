@@ -1,4 +1,4 @@
-# /app/bot_logic.py
+# /bot_logic.py
 # -*- coding: utf-8 -*-
 """
 Core sheet-update logic for Rent RPA.
@@ -20,7 +20,7 @@ import re
 import time
 from gspread.utils import rowcol_to_a1
 
-# Match workbook schema (first 6 columns used by PaymentHistory)
+# History schema (matches workbook)
 PAYMENT_COLS = ['Date Paid', 'Amount Paid', 'REF Number', 'Payer', 'Phone', 'Comments']
 
 # --- NCBA email parser (tolerant to case, '#', date formats) -----------------
@@ -35,7 +35,6 @@ DATE_PAT = (
     r')'
 )
 
-# WHY: Explicit groups for amount, account code, payer, phone, date, ref.
 PATTERN = re.compile(
     rf'payment of KES ([\d,]+\.\d{{2}})\s*'
     rf'for account:\s*PAYLEMAIYAN\s*#?\s*([A-Za-z]\d{{1,2}})\s*'
@@ -51,7 +50,7 @@ def _normalize_ref(ref_raw: str, min_len: int = 8, max_len: int = 16) -> str | N
 
 def _normalize_payer(name: str) -> str:
     n = (name or "").strip()
-    return " ".join(part.capitalize() for part in re.split(r"\s+", n) if part)  # WHY: tidy casing
+    return " ".join(part.capitalize() for part in re.split(r"\s+", n) if part)
 
 def _normalize_date_ddmmyyyy(dt_str: str) -> str:
     dt_str = (dt_str or "").strip()
@@ -68,7 +67,7 @@ def _normalize_date_ddmmyyyy(dt_str: str) -> str:
             return dt.strftime("%d/%m/%Y")
         except ValueError:
             continue
-    return dt_str  # WHY: keep original if parsing fails; written as text
+    return dt_str
 
 def parse_email(text: str) -> Optional[Dict]:
     m = PATTERN.search(text or "")
@@ -77,7 +76,7 @@ def parse_email(text: str) -> Optional[Dict]:
     amt, code, payer, phone, dt_str, ref_raw = m.groups()
     ref = _normalize_ref(ref_raw)
     if not ref:
-        return None  # WHY: REF is our idempotency key
+        return None
     return {
         'Date Paid':   _normalize_date_ddmmyyyy(dt_str),
         'Amount Paid': float((amt or "0").replace(',', '')) if amt else 0.0,
@@ -128,7 +127,6 @@ def _alias_key_for(normalized_header: str) -> Optional[str]:
     return None
 
 def _header_colmap(header: List[str]) -> Dict[str, int]:
-    # WHY: build mapping across canonical/alias names; first win per key
     colmap: Dict[str, int] = {}
     seen = set()
     for idx, name in enumerate(header):
@@ -143,7 +141,7 @@ def _header_colmap(header: List[str]) -> Dict[str, int]:
             seen.add(key)
     return colmap
 
-# --- Utilities: backoff, grid safety, header detection, month helpers --------
+# --- Utilities ---------------------------------------------------------------
 
 def _with_backoff(fn, *args, **kwargs):
     delay = 1.0
@@ -153,7 +151,7 @@ def _with_backoff(fn, *args, **kwargs):
         except Exception as e:
             status = getattr(getattr(e, "resp", None), "status", None)
             if status == 429 or "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                time.sleep(delay); delay *= 2; continue  # WHY: survive transient quota errors
+                time.sleep(delay); delay *= 2; continue
             raise
 
 def _with_backoff_factory(fn_factory, *, max_tries=6):
@@ -169,7 +167,6 @@ def _with_backoff_factory(fn_factory, *, max_tries=6):
 
 def _strip_ws_prefix(a1: str) -> str:
     s = str(a1 or "")
-    # WHY: gspread returns "'Sheet'!A1" sometimes; batch_update expects bare A1
     while True:
         m = re.match(r"^'[^']+'!(.+)$", s)
         if not m: break
@@ -185,10 +182,9 @@ def _ensure_grid_size(ws, need_rows: Optional[int] = None, need_cols: Optional[i
         if need_cols is not None and need_cols > cur_cols:
             _with_backoff(ws.add_cols, need_cols - cur_cols)
     except Exception:
-        pass  # WHY: some mocks/older APIs lack row_count/col_count
+        pass
 
 def _detect_header_row(all_vals, scan_rows: int = 30) -> int:
-    # WHY: headers often sit at row 7; detect by scoring canonical/alias hits
     def score(row):
         s = 0
         for cell in row:
@@ -224,7 +220,6 @@ def _parse_month_cell(s: str) -> Optional[Tuple[int,int]]:
     return None
 
 def _choose_month_display(existing_samples: List[str], dt: datetime) -> str:
-    # WHY: preserve sheet style (e.g., "Sep-2025" vs "2025-09")
     for v in existing_samples:
         t = (v or "").strip()
         if not t: continue
@@ -237,11 +232,6 @@ def _choose_month_display(existing_samples: List[str], dt: datetime) -> str:
     return dt.strftime("%b-%Y")
 
 def _ensure_monthkey_header(ws, header_row0: int, header: list[str], colmap: dict):
-    """
-    Ensure the 'MonthKey' column exists in the header.
-    WHY: We no longer mass-fill historical MonthKey cells to avoid quota spikes.
-    We'll only set MonthKey for the current row we touch during updates.
-    """
     norm = [h.strip().lower() for h in header]
     if "monthkey" not in norm:
         header.append("MonthKey")
@@ -255,13 +245,11 @@ def _sort_by_monthkey(ws, header_row0: int, header: list[str], colmap: dict):
     except ValueError:
         return
     try:
-        ws.sort((mk_idx+1, 'asc'))  # best-effort; Google may 500/429 occasionally
+        ws.sort((mk_idx+1, 'asc'))  # best-effort
     except Exception:
-        # Sorting is cosmetic; skip on transient backend errors
         pass
 
-
-# --- Conditional formatting: arrears/penalties highlights --------------------
+# --- Conditional formatting --------------------------------------------------
 
 def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], cache: Dict, debug: Optional[List[str]] = None):
     if cache.get("cf_applied"): return
@@ -271,7 +259,7 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
         return
     start_row = header_row0 + 1
     requests = [
-        {   # WHY: highlight negative balances (arrears)
+        {
             "addConditionalFormatRule": {
                 "rule": {
                     "ranges": [{"sheetId": sheet_id, "startRowIndex": start_row, "startColumnIndex": colmap["prepay_arrears"], "endColumnIndex": colmap["prepay_arrears"] + 1}],
@@ -280,7 +268,7 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
                 "index": 0,
             }
         },
-        {   # WHY: highlight any penalties
+        {
             "addConditionalFormatRule": {
                 "rule": {
                     "ranges": [{"sheetId": sheet_id, "startRowIndex": start_row, "startColumnIndex": colmap["penalties"], "endColumnIndex": colmap["penalties"] + 1}],
@@ -297,7 +285,7 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
     except Exception as e:
         if debug is not None: debug.append(f"CF skipped: {e}")
 
-# --- Per-sheet cache (reduce API chatter within one run) ---------------------
+# --- Cache -------------------------------------------------------------------
 
 _sheet_cache: Dict[str, Dict] = {}
 def clear_cache(): _sheet_cache.clear()
@@ -305,11 +293,14 @@ def clear_cache(): _sheet_cache.clear()
 def _inc_month(y: int, m: int) -> Tuple[int,int]:
     return (y + (1 if m == 12 else 0), 1 if m == 12 else m + 1)
 
+# --- Main --------------------------------------------------------------------
+
 def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None) -> Dict:
     title = ws.title
     if debug is not None:
         debug.append(f"[{title}] Start REF={payment.get('REF Number')} Amt={payment.get('Amount Paid')} DatePaid={payment.get('Date Paid')}")
 
+    # Prime cache
     if title not in _sheet_cache:
         all_vals = _with_backoff(ws.get_all_values)
         header_row0 = _detect_header_row(all_vals)
@@ -405,7 +396,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     bal_addr       = rowcol_to_a1(row_abs, colmap['prepay_arrears']+1)
     prev_bal_addr  = rowcol_to_a1(row_abs-1, colmap['prepay_arrears']+1)
 
-    # Safe coercions
+    # Safe coercions (avoid #VALUE!)
     paid_num   = f"IFERROR(VALUE({amt_paid_addr}), N({amt_paid_addr}))"
     due_num    = f"IFERROR(VALUE({amt_due_addr}),  N({amt_due_addr}))"
     prev_bal   = f"IFERROR({prev_bal_addr}, 0)"
@@ -419,18 +410,9 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     # Updated penalty rule: >= due+2 AND net_after <= 0
     pen_formula = f"=IF(AND({has_paid}, {has_due}, {net_after} <= 0, {dpaid_expr} >= {ddue_expr} + 2), 3000, 0)"
 
-    # First payment override
-    first_payment_equals_due = f"AND(LEN($B$4)>0, ABS(N($B$4)-{due_num})<0.0001)"
+    # Balance formula (uniform for all rows, no first-payment override)
     if row_abs == header_row0 + 2:
-        bal_formula = f"=IF({first_payment_equals_due}, 0, ({paid_num})-({due_num})-({pen_num}))"
-        # if first-month zeroing applies, also treat est_balance_after as 0 so we don't prepay-loop
-        try:
-            from decimal import Decimal
-            # quick check against numeric current_due_num
-            if current_due_num and abs(current_due_num - float(payment['Amount Paid'])) < 0.0001:
-                est_balance_after = 0.0
-        except Exception:
-            pass
+        bal_formula = f"=({paid_num})-({due_num})-({pen_num})"
     else:
         bal_formula = f"=({prev_bal})+({paid_num})-({due_num})-({pen_num})"
 
@@ -453,7 +435,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     # Header/formatting
     _ensure_conditional_formatting(ws, header_row0, colmap, cache, debug)
     _ensure_monthkey_header(ws, header_row0, header, colmap)
-    # MonthKey for this row
+    # MonthKey for this row (quota-friendly single cell)
     try:
         mk_idx = [h.strip().lower() for h in header].index("monthkey")
         mk_addr = rowcol_to_a1(row_abs, mk_idx + 1)
@@ -462,11 +444,9 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     except Exception:
         pass
 
-    # --- NEW: Auto-consume prepayments into future months --------------------
-    # WHY: reduce positive balances by creating months with Amount Paid = Amount Due
+    # --- Auto-consume prepayments into future months -------------------------
     monthly_due = current_due_num if current_due_num > 0 else 0.0
     safety_max_months = 24  # avoid accidental loops
-
     carry_ref_note = f"{payment['REF Number']}(carry)"
     y, m = target_y, target_m
     added = 0
@@ -483,7 +463,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         new_row[colmap['month']]       = next_month_display
         new_row[colmap['amount_due']]  = f"{monthly_due:g}"
         new_row[colmap['amount_paid']] = f"{monthly_due:g}"
-        new_row[colmap['date_paid']]   = payment['Date Paid']          # early date → no penalty
+        new_row[colmap['date_paid']]   = payment['Date Paid']          # same date → no penalty
         new_row[colmap['ref']]         = carry_ref_note
         new_row[colmap['date_due']]    = next_due_str
         if "comments" in colmap:
@@ -502,6 +482,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         ba2 = rowcol_to_a1(row_abs2, colmap['prepay_arrears']+1)
         prev_ba2 = rowcol_to_a1(row_abs2-1, colmap['prepay_arrears']+1)
 
+        # safe formulas
         paid_num2   = f"IFERROR(VALUE({ap2}), N({ap2}))"
         due_num2    = f"IFERROR(VALUE({ad2}), N({ad2}))"
         prev_bal2   = f"IFERROR({prev_ba2}, 0)"
@@ -511,7 +492,6 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         has_paid2   = f"LEN(TO_TEXT({dp2}))>0"
         has_due2    = f"LEN(TO_TEXT({dd2}))>0"
         net_after2  = f"({prev_bal2} + {paid_num2} - {due_num2})"
-        # with same payment date, penalty should be 0, but keep rule for consistency
         pen_formula2 = f"=IF(AND({has_paid2}, {has_due2}, {net_after2} <= 0, {dpaid2} >= {ddue2} + 2), 3000, 0)"
         bal_formula2 = f"=({prev_bal2})+({paid_num2})-({due_num2})-({pen_num2})"
 
