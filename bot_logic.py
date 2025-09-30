@@ -399,7 +399,8 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     # Safe coercions (avoid #VALUE!)
     paid_num   = f"IFERROR(VALUE({amt_paid_addr}), N({amt_paid_addr}))"
     due_num    = f"IFERROR(VALUE({amt_due_addr}),  N({amt_due_addr}))"
-    prev_bal   = f"IFERROR({prev_bal_addr}, 0)"
+    # WHY: first data row points to header cell (text); force numeric
+    prev_bal   = f"IFERROR(VALUE({prev_bal_addr}), N({prev_bal_addr}))"
     pen_num    = f"IFERROR({pen_addr}, 0)"
     dpaid_expr = f"IFERROR(DATEVALUE(TO_TEXT({date_paid_addr})), {date_paid_addr})"
     ddue_expr  = f"IFERROR(DATEVALUE(TO_TEXT({date_due_addr})),  {date_due_addr})"
@@ -462,8 +463,8 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         new_row = [""] * len(header)
         new_row[colmap['month']]       = next_month_display
         new_row[colmap['amount_due']]  = f"{monthly_due:g}"
-        new_row[colmap['amount_paid']] = f"{monthly_due:g}"
-        new_row[colmap['date_paid']]   = payment['Date Paid']          # same date → no penalty
+        new_row[colmap['amount_paid']] = "0"                            # consume prepay monthly
+        new_row[colmap['date_paid']]   = ""
         new_row[colmap['ref']]         = carry_ref_note
         new_row[colmap['date_due']]    = next_due_str
         if "comments" in colmap:
@@ -485,7 +486,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         # safe formulas
         paid_num2   = f"IFERROR(VALUE({ap2}), N({ap2}))"
         due_num2    = f"IFERROR(VALUE({ad2}), N({ad2}))"
-        prev_bal2   = f"IFERROR({prev_ba2}, 0)"
+        prev_bal2   = f"IFERROR(VALUE({prev_ba2}), N({prev_ba2}))"
         pen_num2    = f"IFERROR({pe2}, 0)"
         dpaid2      = f"IFERROR(DATEVALUE(TO_TEXT({dp2})), {dp2})"
         ddue2       = f"IFERROR(DATEVALUE(TO_TEXT({dd2})), {dd2})"
@@ -499,8 +500,8 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         upd2 = [
             {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['month']+1)),          "values": [[next_month_display]]},
             {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['amount_due']+1)),     "values": [[monthly_due]]},
-            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['amount_paid']+1)),    "values": [[monthly_due]]},
-            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['date_paid']+1)),      "values": [[payment['Date Paid']]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['amount_paid']+1)),    "values": [[0]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['date_paid']+1)),      "values": [[""]]},
             {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['ref']+1)),            "values": [[carry_ref_note]]},
             {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['date_due']+1)),       "values": [[next_due_str]]},
             {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['comments']+1)),       "values": [["Auto prepayment applied"]] if "comments" in colmap else [[""]]},

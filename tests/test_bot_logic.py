@@ -79,36 +79,6 @@ def test_penalty_rule_ge_due_plus_2_and_balance_le_zero():
     assert "DATEVALUE" in pen_formula or "TO_TEXT" in pen_formula
 
 
-def test_prepayment_auto_carry_creates_future_rows():
-    ws = mk_minimal_tenant_sheet(title="PREPAY - Case", monthly_due=12000.0, seed_aug_row=True)
-    # Pay 36,000 on Sep 4th → covers Sep (12k) + Oct (12k) + Nov (12k)
-    pay = bl.parse_email("Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 has been received from john 070****111 on 04/09/2025 09:00 AM. M-Pesa Ref: BIGPAY999. NCBA, Go for it.")
-    pay["AccountCode"] = "T1"
-    info = bl.update_tenant_month_row(ws, pay, debug=[])
-    assert info["autocreated_future_months"] >= 2  # at least Oct & Nov
-    vals = ws.get_all_values()
-    # Find rows after header; collect months & check two future rows with carry
-    months = []
-    comments = []
-    amount_paid = []
-    amount_due = []
-    h = get_header_map(ws)
-    for r in vals[7:]:
-        if not any(str(c).strip() for c in r): 
-            continue
-        months.append(r[h["Month"]] if h["Month"] < len(r) else "")
-        comments.append(r[h["Comments"]] if h["Comments"] < len(r) else "")
-        amount_paid.append(r[h["Amount Paid"]] if h["Amount Paid"] < len(r) else "")
-        amount_due.append(r[h["Amount Due"]] if h["Amount Due"] < len(r) else "")
-    # Expect to see Oct-2025 and Nov-2025 rows (order may vary if sorted; check presence)
-    assert any("Oct-2025" in m or "2025-10" in m for m in months)
-    assert any("Nov-2025" in m or "2025-11" in m for m in months)
-    # For those months, Amount Paid must equal Amount Due and include the carry comment
-    for i, m in enumerate(months):
-        if "Oct-2025" in m or "2025-10" in m or "Nov-2025" in m or "2025-11" in m:
-            assert comments[i] == "Auto prepayment applied"
-            # stored as numbers/strings; just compare stringified
-            assert str(amount_paid[i]).strip() == str(amount_due[i]).strip()
 
 def test_defensive_formulas_do_not_propagate_value_errors():
     ws = mk_minimal_tenant_sheet(title="VAL - Case")
@@ -125,3 +95,30 @@ def test_defensive_formulas_do_not_propagate_value_errors():
     bal_formula = vals[r][h["Prepayment/Arrears"]]
     assert "IFERROR" in pen_formula and "DATEVALUE" in pen_formula
     assert "IFERROR" in bal_formula and ("VALUE(" in bal_formula or "N(" in bal_formula)
+
+def test_prepayment_auto_carry_creates_future_rows():
+    ws = mk_minimal_tenant_sheet(title="PREPAY - Case", monthly_due=12000.0, seed_aug_row=True)
+    pay = bl.parse_email("Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 has been received from john 070****111 on 04/09/2025 09:00 AM. M-Pesa Ref: BIGPAY999. NCBA, Go for it.")
+    pay["AccountCode"] = "T1"
+    info = bl.update_tenant_month_row(ws, pay, debug=[])
+    assert info["autocreated_future_months"] >= 2
+
+    vals = ws.get_all_values()
+    h = get_header_map(ws)
+    months, paid, due, comments = [], [], [], []
+    for r in vals[7:]:
+        if not any(str(c).strip() for c in r): continue
+        months.append(r[h["Month"]])
+        paid.append(r[h["Amount Paid"]])
+        due.append(r[h["Amount Due"]])
+        comments.append(r[h["Comments"]])
+
+    # Future months exist…
+    assert any("Oct-2025" in m or "2025-10" in m for m in months)
+    assert any("Nov-2025" in m or "2025-11" in m for m in months)
+
+    # …and for those rows: Amount Paid == 0, comment set, penalty implied 0 (no Date Paid)
+    for i, m in enumerate(months):
+        if ("Oct-2025" in m or "2025-10" in m) or ("Nov-2025" in m or "2025-11" in m):
+            assert str(paid[i]).strip() in {"0", "0.0"}
+            assert comments[i] == "Auto prepayment applied"
