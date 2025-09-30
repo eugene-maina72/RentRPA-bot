@@ -1,14 +1,15 @@
-# bot_logic.py
+# /app/bot_logic.py
 # -*- coding: utf-8 -*-
 """
 Core sheet-update logic for Rent RPA.
 
-WHY these choices:
-- Header-aware & additive: avoids breaking existing tabs.
-- Robust parser: tolerates case, '#' omission, varied date formats.
-- Business rules baked into formulas: easy to audit in-sheet.
-- Minimal API calls with backoff: protects against quota spikes.
-- MonthKey + sorting: keeps months ordered even with mixed month strings.
+Key rules:
+- Rent due on the 5th.
+- Penalty (KES 3000) if payment date is on/after (due + 2 days) AND net balance <= 0.
+- First-ever payment (B3:B5): if B4 equals monthly rent due, first-month balance = 0.
+- Defensive formulas to prevent #VALUE!.
+- NEW: Auto-consume prepayments — create future months where Amount Paid = Amount Due
+  until remaining prepayment < one month's rent.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ PATTERN = re.compile(
 
 def _normalize_ref(ref_raw: str, min_len: int = 8, max_len: int = 16) -> str | None:
     core = re.sub(r'[^A-Za-z0-9]', '', (ref_raw or '')).upper()
-    return core if min_len <= len(core) <= max_len else None  # WHY: reject obviously bad refs
+    return core if min_len <= len(core) <= max_len else None  # why: reject bad refs
 
 def _normalize_payer(name: str) -> str:
     n = (name or "").strip()
@@ -83,8 +84,8 @@ def parse_email(text: str) -> Optional[Dict]:
         'REF Number':  ref,
         'Payer':       _normalize_payer(payer),
         'Phone':       (phone or "").strip(),
-        'AccountCode': (code or "").upper(),       # WHY: route to sheet by code
-        'Comments':    "",                         # WHY: keep schema stable; never overwrite user comments
+        'AccountCode': (code or "").upper(),
+        'Comments':    "",
     }
 
 # --- Canonical headers & helpers --------------------------------------------
@@ -273,35 +274,19 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
         {   # WHY: highlight negative balances (arrears)
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row,
-                        "startColumnIndex": colmap["prepay_arrears"],
-                        "endColumnIndex": colmap["prepay_arrears"] + 1
-                    }],
-                    "booleanRule": {
-                        "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
-                        "format": {"backgroundColor": {"red": 1.0, "green": 0.84, "blue": 0.84}}
-                    }
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": start_row, "startColumnIndex": colmap["prepay_arrears"], "endColumnIndex": colmap["prepay_arrears"] + 1}],
+                    "booleanRule": {"condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]}, "format": {"backgroundColor": {"red": 1.0, "green": 0.84, "blue": 0.84}}},
                 },
-                "index": 0
+                "index": 0,
             }
         },
         {   # WHY: highlight any penalties
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row,
-                        "startColumnIndex": colmap["penalties"],
-                        "endColumnIndex": colmap["penalties"] + 1
-                    }],
-                    "booleanRule": {
-                        "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
-                        "format": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.6}}
-                    }
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": start_row, "startColumnIndex": colmap["penalties"], "endColumnIndex": colmap["penalties"] + 1}],
+                    "booleanRule": {"condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]}, "format": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.6}}},
                 },
-                "index": 1
+                "index": 1,
             }
         },
     ]
@@ -317,7 +302,8 @@ def _ensure_conditional_formatting(ws, header_row0: int, colmap: Dict[str,int], 
 _sheet_cache: Dict[str, Dict] = {}
 def clear_cache(): _sheet_cache.clear()
 
-# --- Main: update a tenant tab for a given payment ---------------------------
+def _inc_month(y: int, m: int) -> Tuple[int,int]:
+    return (y + (1 if m == 12 else 0), 1 if m == 12 else m + 1)
 
 def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None) -> Dict:
     title = ws.title
@@ -355,6 +341,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     existing_month_samples = [r[colmap['month']] for r in rows if len(r) > colmap['month'] and r[colmap['month']]]
     month_display = _choose_month_display(existing_month_samples, dt_paid)
 
+    # Find or create target month row
     row_abs = None; row_idx = None
     for idx_in_rows, r in enumerate(rows, start=1):
         if len(r) <= colmap['month']: continue
@@ -395,12 +382,21 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     ref_new     = payment['REF Number'] if not prev_ref else f"{prev_ref}, {payment['REF Number']}"
     due_str     = datetime(target_y, target_m, 5).strftime("%d/%m/%Y")
 
+    # Numeric due for estimation & for auto-prepay loop
+    current_due_num = _num(row_vals[colmap['amount_due']]) if row_vals[colmap['amount_due']] else \
+                      (_num(rows[row_idx-1][colmap['amount_due']]) if row_idx > 0 else 0.0)
+
+    # Estimate new balance (no penalty when prepaying)
+    prev_bal_num = _num(rows[row_idx-1][colmap['prepay_arrears']]) if row_idx > 0 and len(rows[row_idx-1]) > colmap['prepay_arrears'] else 0.0
+    est_balance_after = prev_bal_num + float(payment['Amount Paid']) - current_due_num
+
     row_vals[colmap['month']]       = month_display
     row_vals[colmap['amount_paid']] = str(paid_after)
     row_vals[colmap['date_paid']]   = payment['Date Paid']
     row_vals[colmap['ref']]         = ref_new
     row_vals[colmap['date_due']]    = due_str
 
+    # A1s for formulas/values
     amt_paid_addr  = rowcol_to_a1(row_abs, colmap['amount_paid']+1)
     amt_due_addr   = rowcol_to_a1(row_abs, colmap['amount_due']+1)
     date_paid_addr = rowcol_to_a1(row_abs, colmap['date_paid']+1)
@@ -409,31 +405,37 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     bal_addr       = rowcol_to_a1(row_abs, colmap['prepay_arrears']+1)
     prev_bal_addr  = rowcol_to_a1(row_abs-1, colmap['prepay_arrears']+1)
 
-    # WHY: normalize text dates so comparisons work even if stored as text
-    dpaid_expr  = f"IF(ISTEXT({date_paid_addr}), DATEVALUE({date_paid_addr}), {date_paid_addr})"
-    ddue_expr   = f"IF(ISTEXT({date_due_addr}),  DATEVALUE({date_due_addr}),  {date_due_addr})"
-    prev_bal_safe = f"IFERROR({prev_bal_addr},0)"
-    net_after = f"({prev_bal_safe} + N({amt_paid_addr}) - N({amt_due_addr}))"
+    # Safe coercions
+    paid_num   = f"IFERROR(VALUE({amt_paid_addr}), N({amt_paid_addr}))"
+    due_num    = f"IFERROR(VALUE({amt_due_addr}),  N({amt_due_addr}))"
+    prev_bal   = f"IFERROR({prev_bal_addr}, 0)"
+    pen_num    = f"IFERROR({pen_addr}, 0)"
+    dpaid_expr = f"IFERROR(DATEVALUE(TO_TEXT({date_paid_addr})), {date_paid_addr})"
+    ddue_expr  = f"IFERROR(DATEVALUE(TO_TEXT({date_due_addr})),  {date_due_addr})"
+    has_paid   = f"LEN(TO_TEXT({date_paid_addr}))>0"
+    has_due    = f"LEN(TO_TEXT({date_due_addr}))>0"
+    net_after  = f"({prev_bal} + {paid_num} - {due_num})"
 
-    # BUSINESS RULE: Penalty if paid > due + 2 days AND net balance negative
-    pen_formula = (
-        f"=IF(AND(LEN({date_paid_addr})>0, LEN({date_due_addr})>0, "
-        f"{net_after} < 0, "
-        f"{dpaid_expr} > {ddue_expr} + 2), 3000, 0)"
-    )
+    # Updated penalty rule: >= due+2 AND net_after <= 0
+    pen_formula = f"=IF(AND({has_paid}, {has_due}, {net_after} <= 0, {dpaid_expr} >= {ddue_expr} + 2), 3000, 0)"
 
-    # Rolling balance (first data row vs subsequent)
+    # First payment override
+    first_payment_equals_due = f"AND(LEN($B$4)>0, ABS(N($B$4)-{due_num})<0.0001)"
     if row_abs == header_row0 + 2:
-        bal_formula = f"=N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
+        bal_formula = f"=IF({first_payment_equals_due}, 0, ({paid_num})-({due_num})-({pen_num}))"
+        # if first-month zeroing applies, also treat est_balance_after as 0 so we don't prepay-loop
+        try:
+            from decimal import Decimal
+            # quick check against numeric current_due_num
+            if current_due_num and abs(current_due_num - float(payment['Amount Paid'])) < 0.0001:
+                est_balance_after = 0.0
+        except Exception:
+            pass
     else:
-        bal_formula = f"=N({prev_bal_addr})+N({amt_paid_addr})-N({amt_due_addr})-N({pen_addr})"
+        bal_formula = f"=({prev_bal})+({paid_num})-({due_num})-({pen_num})"
 
-    _target_cols = [
-        colmap['month']+1, colmap['amount_paid']+1, colmap['date_paid']+1,
-        colmap['ref']+1, colmap['date_due']+1, colmap['penalties']+1, colmap['prepay_arrears']+1
-    ]
-    _ensure_grid_size(ws, need_rows=row_abs, need_cols=max(_target_cols))
-
+    # Write this row
+    _ensure_grid_size(ws, need_rows=row_abs, need_cols=len(header))
     updates = [
         {"range": _strip_ws_prefix(rowcol_to_a1(row_abs, colmap['month']+1)),          "values": [[month_display]]},
         {"range": _strip_ws_prefix(rowcol_to_a1(row_abs, colmap['amount_paid']+1)),    "values": [[paid_after]]},
@@ -448,10 +450,10 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     if debug is not None:
         debug.append(f"[{title}] R{row_abs}: paid {paid_before}→{paid_after}, due={due_str}")
 
-    
+    # Header/formatting
     _ensure_conditional_formatting(ws, header_row0, colmap, cache, debug)
-    _ensure_monthkey_header(ws, header_row0, header, colmap)  # header only, no mass-fill
-    # Set MonthKey only for the row we just updated (dramatically reduces writes)
+    _ensure_monthkey_header(ws, header_row0, header, colmap)
+    # MonthKey for this row
     try:
         mk_idx = [h.strip().lower() for h in header].index("monthkey")
         mk_addr = rowcol_to_a1(row_abs, mk_idx + 1)
@@ -459,8 +461,90 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         _with_backoff(ws.update, mk_addr, [[mk_value]], value_input_option="USER_ENTERED")
     except Exception:
         pass
-    _sort_by_monthkey(ws, header_row0, header, colmap)
 
+    # --- NEW: Auto-consume prepayments into future months --------------------
+    # WHY: reduce positive balances by creating months with Amount Paid = Amount Due
+    monthly_due = current_due_num if current_due_num > 0 else 0.0
+    safety_max_months = 24  # avoid accidental loops
+
+    carry_ref_note = f"{payment['REF Number']}(carry)"
+    y, m = target_y, target_m
+    added = 0
+
+    while monthly_due > 0 and est_balance_after >= monthly_due and added < safety_max_months:
+        # next month
+        y, m = _inc_month(y, m)
+        next_due_str = datetime(y, m, 5).strftime("%d/%m/%Y")
+        dt_next = datetime(y, m, 1)
+        next_month_display = _choose_month_display(existing_month_samples or [month_display], dt_next)
+
+        # create/app row
+        new_row = [""] * len(header)
+        new_row[colmap['month']]       = next_month_display
+        new_row[colmap['amount_due']]  = f"{monthly_due:g}"
+        new_row[colmap['amount_paid']] = f"{monthly_due:g}"
+        new_row[colmap['date_paid']]   = payment['Date Paid']          # early date → no penalty
+        new_row[colmap['ref']]         = carry_ref_note
+        new_row[colmap['date_due']]    = next_due_str
+        if "comments" in colmap:
+            new_row[colmap['comments']] = "Auto prepayment applied"
+
+        rows.append(new_row)
+        row_idx2 = len(rows) - 1
+        row_abs2 = header_row0 + 1 + (row_idx2 + 1)
+
+        # addresses
+        ap2 = rowcol_to_a1(row_abs2, colmap['amount_paid']+1)
+        ad2 = rowcol_to_a1(row_abs2, colmap['amount_due']+1)
+        dp2 = rowcol_to_a1(row_abs2, colmap['date_paid']+1)
+        dd2 = rowcol_to_a1(row_abs2, colmap['date_due']+1)
+        pe2 = rowcol_to_a1(row_abs2, colmap['penalties']+1)
+        ba2 = rowcol_to_a1(row_abs2, colmap['prepay_arrears']+1)
+        prev_ba2 = rowcol_to_a1(row_abs2-1, colmap['prepay_arrears']+1)
+
+        paid_num2   = f"IFERROR(VALUE({ap2}), N({ap2}))"
+        due_num2    = f"IFERROR(VALUE({ad2}), N({ad2}))"
+        prev_bal2   = f"IFERROR({prev_ba2}, 0)"
+        pen_num2    = f"IFERROR({pe2}, 0)"
+        dpaid2      = f"IFERROR(DATEVALUE(TO_TEXT({dp2})), {dp2})"
+        ddue2       = f"IFERROR(DATEVALUE(TO_TEXT({dd2})), {dd2})"
+        has_paid2   = f"LEN(TO_TEXT({dp2}))>0"
+        has_due2    = f"LEN(TO_TEXT({dd2}))>0"
+        net_after2  = f"({prev_bal2} + {paid_num2} - {due_num2})"
+        # with same payment date, penalty should be 0, but keep rule for consistency
+        pen_formula2 = f"=IF(AND({has_paid2}, {has_due2}, {net_after2} <= 0, {dpaid2} >= {ddue2} + 2), 3000, 0)"
+        bal_formula2 = f"=({prev_bal2})+({paid_num2})-({due_num2})-({pen_num2})"
+
+        _ensure_grid_size(ws, need_rows=row_abs2, need_cols=len(header))
+        upd2 = [
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['month']+1)),          "values": [[next_month_display]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['amount_due']+1)),     "values": [[monthly_due]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['amount_paid']+1)),    "values": [[monthly_due]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['date_paid']+1)),      "values": [[payment['Date Paid']]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['ref']+1)),            "values": [[carry_ref_note]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['date_due']+1)),       "values": [[next_due_str]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['comments']+1)),       "values": [["Auto prepayment applied"]] if "comments" in colmap else [[""]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['penalties']+1)),      "values": [[pen_formula2]]},
+            {"range": _strip_ws_prefix(rowcol_to_a1(row_abs2, colmap['prepay_arrears']+1)), "values": [[bal_formula2]]},
+        ]
+        _with_backoff_factory(lambda: ws.batch_update(deepcopy(upd2), value_input_option='USER_ENTERED'))
+
+        # MonthKey for this row
+        try:
+            mk_idx = [h.strip().lower() for h in header].index("monthkey")
+            mk_addr2 = rowcol_to_a1(row_abs2, mk_idx + 1)
+            mk_value2 = f"{y:04d}-{m:02d}"
+            _with_backoff(ws.update, mk_addr2, [[mk_value2]], value_input_option="USER_ENTERED")
+        except Exception:
+            pass
+
+        est_balance_after -= monthly_due
+        added += 1
+        if debug is not None:
+            debug.append(f"[{title}] Auto prepayment applied → created {next_month_display} with paid={monthly_due:g}")
+
+    # final sort once
+    _sort_by_monthkey(ws, header_row0, header, colmap)
 
     return {
         "sheet": ws.title,
@@ -469,7 +553,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         "paid_before": paid_before,
         "paid_after": paid_after,
         "date_due": due_str,
-        "month_row": row_abs,
+        "autocreated_future_months": added,
         "ref_added": payment.get("REF Number"),
         "formulas_set": {"balance": True, "penalties": True},
     }

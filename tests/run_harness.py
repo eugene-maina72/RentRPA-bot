@@ -1,81 +1,55 @@
 # tests/run_harness.py
 # Offline E2E check on your real workbook with synthetic emails
 
-import pandas as pd
 from pathlib import Path
-import re
-from tests.mock_gspread import MockWorksheet
-import tests.test_logic as bl
+from mock_gspread import MockWorksheet
+import test_logic as bl
 
-WB = Path("tests/RENT TRACKING-Lemaiyan Heights test.xlsx")
+CANONICAL_HEADER = ['Month','Date Due','Amount Due','Amount Paid','Date Paid','REF Number','Comments','Prepayment/Arrears','Penalties']
 
-def load_ws(sheet_name: str):
-    df = pd.read_excel(WB, sheet_name=sheet_name, header=None)
-    return MockWorksheet(sheet_name, df.fillna("").values.tolist())
+def mk_minimal_tenant_sheet(title="HARNESS - T1", monthly_due=12000.0, seed_aug_row=False):
+    grid = [[""]*10 for _ in range(6)]
+    grid.append(CANONICAL_HEADER[:])
+    if seed_aug_row:
+        grid.append(["Aug-2025","05/08/2025", f"{monthly_due:g}", "0", "", "", "None", "0", "0"])
+    return MockWorksheet(title, grid)
 
-def email(amount, code, payer, phone, dt_str, ref, with_hash=True, lowercase=False):
-    code2 = code.lower() if lowercase else code
-    payer2 = payer.lower() if lowercase else payer
-    h = f"#{code2}" if with_hash else f" {code2}"
-    return (f"Your M-Pesa payment of KES {amount:,.2f} for account: PAYLEMAIYAN {h} "
-            f"has been received from {payer2} {phone} on {dt_str}. "
-            f"M-Pesa Ref: {ref}. NCBA, Go for it.")
-
-CASES = [
-    ("E5 - Catherine", email(12000, "E5", "CATHERINE GATHONI", "070****117", "05/08/2025 10:47 PM", "TH543V6HDY", True, False)),
-    ("B3 - Rama",      email(12000, "B3", "rama mwangi",      "071****111", "12/09/2025 09:30 PM", "ABCD123456", True, True)),
-    ("E4 - Benjamin",  email(12000, "E4", "john doe",         "072****222", "06/09/2025 08:15 PM", "XYZ9876543", False, True)),
-]
-
-def _detect(vals): return bl._detect_header_row(vals)
-def _colmap(h):    return bl._header_colmap(h)
-
-def snapshot(ws, month=None):
+def case_penalty():
+    ws = mk_minimal_tenant_sheet(title="HARNESS - PEN")
+    text = "Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from test name 070****111 on 08/09/2025 09:00 PM. M-Pesa Ref: ABCD123456. NCBA, Go for it."
+    p = bl.parse_email(text); p["AccountCode"] = "T1"
+    info = bl.update_tenant_month_row(ws, p, debug=[])
     vals = ws.get_all_values()
-    h0 = _detect(vals); header = vals[h0]
-    cmap = _colmap(header); rows = vals[h0+1:]
-    tgt = None
-    for i, r in enumerate(rows):
-        if len(r) > cmap["month"] and r[cmap["month"]].strip() == (month or ""):
-            tgt = i; break
-    if tgt is None:
-        for i in range(len(rows)-1, -1, -1):
-            if any(c.strip() for c in rows[i]): tgt = i; break
-    r = rows[tgt] if tgt is not None else [""]*len(header)
-    def g(k): 
-        idx = cmap[k]; 
-        return r[idx] if idx < len(r) else ""
-    return {
-        "Month": g("month"),
-        "Amount Paid": g("amount_paid"),
-        "Date Paid": g("date_paid"),
-        "REF Number": g("ref"),
-        "Date Due": g("date_due"),
-        "Penalties": g("penalties"),
-        "Prepayment/Arrears": g("prepay_arrears"),
-    }, h0+1+(tgt+1 if tgt is not None else 1), header, cmap
+    print("== PENALTY CASE ==")
+    print("Row:", info["row"], "Month:", info["month"])
+    print("Penalty formula:", vals[info["row"]-1][vals[6].index("Penalties")])
+    print()
 
-def run():
-    results = []
-    for sheet, text in CASES:
-        ws = load_ws(sheet)
-        pay = bl.parse_email(text)
-        before, *_ = snapshot(ws)
-        info = bl.update_tenant_month_row(ws, pay, debug=[])
-        after, row_abs, header, cmap = snapshot(ws, month=info["month"])
-        rowvals = ws.get_all_values()[row_abs-1]
-        penalty_formula = rowvals[cmap["penalties"]]
-        balance_formula = rowvals[cmap["prepay_arrears"]]
-        results.append((sheet, info, before, after, penalty_formula, balance_formula))
-    return results
+def case_first_payment_zero():
+    ws = mk_minimal_tenant_sheet(title="HARNESS - FIRST")
+    text = "Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from hello 070****111 on 05/09/2025 10:00 AM. M-Pesa Ref: FSTPAY001. NCBA, Go for it."
+    p = bl.parse_email(text); p["AccountCode"] = "T1"
+    ws.update("B4:B5", [["12000"],["FSTPAY001"]])
+    info = bl.update_tenant_month_row(ws, p, debug=[])
+    vals = ws.get_all_values()
+    print("== FIRST PAYMENT ZERO ==")
+    print("Row:", info["row"], "Month:", info["month"])
+    print("Balance formula:", vals[info["row"]-1][vals[6].index("Prepayment/Arrears")])
+    print()
+
+def case_prepayment_carry():
+    ws = mk_minimal_tenant_sheet(title="HARNESS - PREPAY", seed_aug_row=True)
+    text = "Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 has been received from john 070****111 on 04/09/2025 09:00 AM. M-Pesa Ref: BIGPAY999. NCBA, Go for it."
+    p = bl.parse_email(text); p["AccountCode"] = "T1"
+    info = bl.update_tenant_month_row(ws, p, debug=[])
+    vals = ws.get_all_values()
+    months = [r[vals[6].index("Month")] for r in vals[7:] if any(str(c).strip() for c in r)]
+    print("== PREPAYMENT CARRY ==")
+    print("Base row:", info["row"], "Created future months:", info["autocreated_future_months"])
+    print("Months present:", months)
+    print()
 
 if __name__ == "__main__":
-    out = run()
-    for sheet, info, before, after, pen, bal in out:
-        print(f"== {sheet} | Month {info['month']} | Row {info['row']}")
-        print(f"Paid {info['paid_before']} -> {info['paid_after']}")
-        print("Before:", before)
-        print("After :", after)
-        print("Penalty formula:", pen)
-        print("Balance formula:", bal)
-        print()
+    case_penalty()
+    case_first_payment_zero()
+    case_prepayment_carry()

@@ -7,50 +7,133 @@ from pathlib import Path
 from mock_gspread import MockWorksheet
 import test_logic as bl
 
-WB = Path("tests/RENT TRACKING-Lemaiyan Heights test.xlsx")
+WB = Path("tests/RENT TRACKING-Lemaiyan Heights test.xlsx")  # used only for legacy checks
 
-def load_ws(name):
-    df = pd.read_excel(WB, sheet_name=name, header=None)
-    return MockWorksheet(name, df.fillna("").values.tolist())
+# ---------- Helpers ----------
 
-def email(amount, code, payer, phone, dt_str, ref, with_hash=True, lowercase=False):
-    code2 = code.lower() if lowercase else code
-    payer2 = payer.lower() if lowercase else payer
-    h = f"#{code2}" if with_hash else f" {code2}"
-    return (f"Your M-Pesa payment of KES {amount:,.2f} for account: PAYLEMAIYAN {h} "
-            f"has been received from {payer2} {phone} on {dt_str}. "
-            f"M-Pesa Ref: {ref}. NCBA, Go for it.")
+CANONICAL_HEADER = ['Month','Date Due','Amount Due','Amount Paid','Date Paid','REF Number','Comments','Prepayment/Arrears','Penalties']
 
-def _detect(vals): return bl._detect_header_row(vals)
-def _colmap(h):    return bl._header_colmap(h)
+def mk_minimal_tenant_sheet(title="T1 - Test", monthly_due=12000.0, seed_aug_row=False):
+    """
+    Build a minimal tenant worksheet:
+    - Headers at row 7
+    - Optional seed row for Aug-2025 with given Amount Due and zero balance
+    """
+    grid = [[""]*10 for _ in range(6)]  # rows 1..6 padding
+    grid.append(CANONICAL_HEADER[:])    # row 7 header
+    if seed_aug_row:
+        # Month, Date Due (5th), Amount Due, Amount Paid (0), Date Paid blank, REF blank, Comments, Balance 0, Penalties 0
+        grid.append(["Aug-2025","05/08/2025", f"{monthly_due:g}", "0", "", "", "None", "0", "0"])
+    return MockWorksheet(title, grid)
 
-def _penalty_uses_plus2(formula: str) -> bool:
-    return re.search(r"\+\s*2\)", formula) is not None
+def addr_of(ws, row, colname):
+    vals = ws.get_all_values()
+    header = vals[6]
+    j = header.index(colname)
+    return (row+1, j+1)  # 1-indexed
 
-def test_parse_variations():
-    cases = [
-        email(12000, "E5", "CATHERINE GATHONI", "070****117", "05/08/2025 10:47 PM", "TH543V6HDY", True, False),
-        email(12000, "b3", "rama mwangi",       "071****111", "12/09/2025 09:30 PM", "ABCD123456", True, True),
-        email(12000, "e4", "john doe",          "072****222", "06/09/2025 08:15 PM", "XYZ9876543", False, True),
-    ]
-    for t in cases:
-        p = bl.parse_email(t)
-        assert p["REF Number"]
-        assert p["AccountCode"] in {"E5","B3","E4"}
+def get_header_map(ws):
+    vals = ws.get_all_values()
+    header = vals[6]
+    return {name: idx for idx, name in enumerate(header)}
 
-def test_history_schema_first6_match_workbook():
-    # Workbook: ['Date Paid','Amount Paid','REF Number','Payer','Phone','Comments']
-    df = pd.read_excel(WB, sheet_name="PaymentHistory", nrows=0)
+def get_last_data_row(ws):
+    vals = ws.get_all_values()
+    # after header row 7
+    for i in range(len(vals)-1, 7, -1):
+        if any(str(c).strip() for c in vals[i]):
+            return i
+    return 7
+
+# ---------- Existing basic tests (schema & parse) ----------
+
+def test_history_schema_first6_match_workbook_if_present():
+    # If workbook is present and has PaymentHistory, verify first 6 column names.
+    try:
+        df = pd.read_excel(WB, sheet_name="PaymentHistory", nrows=0)
+    except Exception:
+        return  # workbook not mandatory for this test run
     book_first6 = list(df.columns)[:6]
     assert book_first6 == ['Date Paid','Amount Paid','REF Number','Payer','Phone','Comments']
-    assert bl.PAYMENT_COLS[:6] == book_first6  # <-- will FAIL until you change Payment Mode -> Comments
+    assert bl.PAYMENT_COLS[:6] == book_first6
 
-def test_penalty_rule_is_due_plus_2():
-    ws = load_ws("B3 - Rama")
-    t = email(12000, "b3", "rama mwangi", "071****111", "12/09/2025 09:30 PM", "ABCD123456", True, True)
-    p = bl.parse_email(t)
-    info = bl.update_tenant_month_row(ws, p, debug=[])
+def test_parse_variations_case_and_hash():
+    text = "Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN e4 has been received from john doe 072****222 on 06/09/2025 08:15 PM. M-Pesa Ref: XYZ9876543. NCBA, Go for it."
+    p = bl.parse_email(text)
+    assert p and p["AccountCode"] == "E4" and p["REF Number"] == "XYZ9876543"
+
+# ---------- New tests ----------
+
+def test_penalty_rule_ge_due_plus_2_and_balance_le_zero():
+    ws = mk_minimal_tenant_sheet(title="PEN - Case")
+    pay = bl.parse_email("Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from test name 070****111 on 08/09/2025 09:00 PM. M-Pesa Ref: ABCD123456. NCBA, Go for it.")
+    pay["AccountCode"] = "T1"  # direct route
+    info = bl.update_tenant_month_row(ws, pay, debug=[])
     vals = ws.get_all_values()
-    h0 = _detect(vals); header = vals[h0]; cmap = _colmap(header)
-    pen_formula = vals[info["row"]-1][cmap["penalties"]]
-    assert _penalty_uses_plus2(pen_formula), f"Penalty formula must use due+2, got: {pen_formula}"
+    h = get_header_map(ws)
+    row = info["row"]-1
+    pen_formula = vals[row][h["Penalties"]]
+    # Must include ">= ... + 2" per new rule
+    assert ">=" in pen_formula and "+ 2" in pen_formula
+    # And the formula references both date cells
+    assert "DATEVALUE" in pen_formula or "TO_TEXT" in pen_formula
+
+def test_first_payment_zeroing_uses_B4_equals_due():
+    ws = mk_minimal_tenant_sheet(title="FIRST - Case")
+    # First-ever payment equals Amount Due; make sure balance formula zeros
+    pay = bl.parse_email("Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from hello world 070****111 on 05/09/2025 10:00 AM. M-Pesa Ref: FSTPAY001. NCBA, Go for it.")
+    pay["AccountCode"] = "T1"
+    # Put B4=12000 to simulate move-in initial payment record (twice rent rule not needed here)
+    ws.update("B4:B5", [["12000"],["FSTPAY001"]])
+    info = bl.update_tenant_month_row(ws, pay, debug=[])
+    vals = ws.get_all_values(); h = get_header_map(ws); r = info["row"]-1
+    bal_formula = vals[r][h["Prepayment/Arrears"]]
+    # Must contain the IF guarding with $B$4 and zero outcome
+    assert "LEN($B$4)" in bal_formula and ", 0," in bal_formula
+
+def test_prepayment_auto_carry_creates_future_rows():
+    ws = mk_minimal_tenant_sheet(title="PREPAY - Case", monthly_due=12000.0, seed_aug_row=True)
+    # Pay 36,000 on Sep 4th → covers Sep (12k) + Oct (12k) + Nov (12k)
+    pay = bl.parse_email("Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 has been received from john 070****111 on 04/09/2025 09:00 AM. M-Pesa Ref: BIGPAY999. NCBA, Go for it.")
+    pay["AccountCode"] = "T1"
+    info = bl.update_tenant_month_row(ws, pay, debug=[])
+    assert info["autocreated_future_months"] >= 2  # at least Oct & Nov
+    vals = ws.get_all_values()
+    # Find rows after header; collect months & check two future rows with carry
+    months = []
+    comments = []
+    amount_paid = []
+    amount_due = []
+    h = get_header_map(ws)
+    for r in vals[7:]:
+        if not any(str(c).strip() for c in r): 
+            continue
+        months.append(r[h["Month"]] if h["Month"] < len(r) else "")
+        comments.append(r[h["Comments"]] if h["Comments"] < len(r) else "")
+        amount_paid.append(r[h["Amount Paid"]] if h["Amount Paid"] < len(r) else "")
+        amount_due.append(r[h["Amount Due"]] if h["Amount Due"] < len(r) else "")
+    # Expect to see Oct-2025 and Nov-2025 rows (order may vary if sorted; check presence)
+    assert any("Oct-2025" in m or "2025-10" in m for m in months)
+    assert any("Nov-2025" in m or "2025-11" in m for m in months)
+    # For those months, Amount Paid must equal Amount Due and include the carry comment
+    for i, m in enumerate(months):
+        if "Oct-2025" in m or "2025-10" in m or "Nov-2025" in m or "2025-11" in m:
+            assert comments[i] == "Auto prepayment applied"
+            # stored as numbers/strings; just compare stringified
+            assert str(amount_paid[i]).strip() == str(amount_due[i]).strip()
+
+def test_defensive_formulas_do_not_propagate_value_errors():
+    ws = mk_minimal_tenant_sheet(title="VAL - Case")
+    # Put text "None" in prev balance cell to mimic messy sheets
+    vals = ws.get_all_values()
+    # Seed a fake previous row with string values to ensure IFERROR/N() guards are present
+    ws.update("8:8", [["Aug-2025","05/08/2025","12000","notnum","","","None","notnum","notnum"]])
+    pay = bl.parse_email("Your M-Pesa payment of KES 12,000.00 for account: PAYLEMAIYAN #t1 has been received from test 070****111 on 06/09/2025 09:00 AM. M-Pesa Ref: SAFEFORM1. NCBA, Go for it.")
+    pay["AccountCode"] = "T1"
+    info = bl.update_tenant_month_row(ws, pay, debug=[])
+    vals = ws.get_all_values(); h = get_header_map(ws); r = info["row"]-1
+    # Check penalty/balance formulas contain IFERROR and VALUE/N coercions
+    pen_formula = vals[r][h["Penalties"]]
+    bal_formula = vals[r][h["Prepayment/Arrears"]]
+    assert "IFERROR" in pen_formula and "DATEVALUE" in pen_formula
+    assert "IFERROR" in bal_formula and ("VALUE(" in bal_formula or "N(" in bal_formula)

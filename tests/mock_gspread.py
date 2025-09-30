@@ -1,6 +1,7 @@
 # tests/mock_gspread.py
 # Minimal gspread-like mocks for offline testing of bot_logic.update_tenant_month_row
 
+
 import re
 import numpy as np
 
@@ -67,6 +68,12 @@ class MockWorksheet:
         for item in updates:
             self.update(item["range"], item["values"], value_input_option=value_input_option)
         return True
+
+    def append_rows(self, rows, value_input_option=None):
+        for r in rows:
+            self._vals.append([str(x) for x in r])
+        self.row_count = len(self._vals)
+        self.col_count = max(self.col_count, len(self._vals[0]))
 
     def add_rows(self, n):
         _ensure_size(self._vals, len(self._vals) + n, len(self._vals[0]))
