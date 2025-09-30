@@ -98,27 +98,40 @@ def test_defensive_formulas_do_not_propagate_value_errors():
 
 def test_prepayment_auto_carry_creates_future_rows():
     ws = mk_minimal_tenant_sheet(title="PREPAY - Case", monthly_due=12000.0, seed_aug_row=True)
-    pay = bl.parse_email("Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 has been received from john 070****111 on 04/09/2025 09:00 AM. M-Pesa Ref: BIGPAY999. NCBA, Go for it.")
+    pay = bl.parse_email(
+        "Your M-Pesa payment of KES 36,000.00 for account: PAYLEMAIYAN #t1 "
+        "has been received from john 070****111 on 04/09/2025 09:00 AM. "
+        "M-Pesa Ref: BIGPAY999. NCBA, Go for it."
+    )
     pay["AccountCode"] = "T1"
+
     info = bl.update_tenant_month_row(ws, pay, debug=[])
-    assert info["autocreated_future_months"] >= 2
+    assert info["autocreated_future_months"] >= 2  # e.g., Oct & Nov created
 
     vals = ws.get_all_values()
     h = get_header_map(ws)
-    months, paid, due, comments = [], [], [], []
+
+    future_months = []
     for r in vals[7:]:
-        if not any(str(c).strip() for c in r): continue
-        months.append(r[h["Month"]])
-        paid.append(r[h["Amount Paid"]])
-        due.append(r[h["Amount Due"]])
-        comments.append(r[h["Comments"]])
+        if not any(str(c).strip() for c in r):
+            continue
+        month = r[h["Month"]]
+        if any(k in month for k in ("Oct-2025", "2025-10", "Nov-2025", "2025-11")):
+            future_months.append({
+                "Month": month,
+                "AmountPaid": r[h["Amount Paid"]],
+                "AmountDue": r[h["Amount Due"]],
+                "DatePaid": r[h["Date Paid"]],
+                "Comments": r[h["Comments"]],
+                "Penalties": r[h["Penalties"]],
+            })
 
-    # Future months exist…
-    assert any("Oct-2025" in m or "2025-10" in m for m in months)
-    assert any("Nov-2025" in m or "2025-11" in m for m in months)
+    # Must have at least two future months
+    assert len(future_months) >= 2
 
-    # …and for those rows: Amount Paid == 0, comment set, penalty implied 0 (no Date Paid)
-    for i, m in enumerate(months):
-        if ("Oct-2025" in m or "2025-10" in m) or ("Nov-2025" in m or "2025-11" in m):
-            assert str(paid[i]).strip() in {"0", "0.0"}
-            assert comments[i] == "Auto prepayment applied"
+    # In auto-carry rows: Amount Paid == 0, Date Paid blank, comment set, penalty formula present
+    for fm in future_months:
+        assert str(fm["AmountPaid"]).strip() in {"0", "0.0"}
+        assert fm["Comments"] == "Auto prepayment applied"
+        assert str(fm["DatePaid"]).strip() == ""  # blank ⇒ no penalty
+        assert isinstance(fm["Penalties"], str) and fm["Penalties"].startswith("=IF(")
