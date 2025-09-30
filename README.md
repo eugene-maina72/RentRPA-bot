@@ -28,6 +28,7 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 ├── data
 ├── images
 ├── docs
+├── tests
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── RentRPA.ipynb
@@ -73,7 +74,7 @@ Automate your apartment rent payment tracking using this Streamlit-based RPA bot
 
 ```bash
 
-streamlit run streamlit_app.py
+    streamlit run streamlit_app.py
 
 ```
 
@@ -86,8 +87,6 @@ streamlit run streamlit_app.py
     * Add client_secret.json to the repository (secure it properly in production).
 
     * Deploy and run the app!
-    
-    * The bot is already deployed [here](https://lemaiyan-rpa.streamlit.app) 
 
 ## 📈 How It Works
 
@@ -116,6 +115,8 @@ streamlit run streamlit_app.py
 * Fork this repository.
 
 * Create a new branch (feature/your-feature).
+
+* Test you changes using the tests files
 
 * Commit your changes.
 
