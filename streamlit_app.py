@@ -396,7 +396,7 @@ with st.expander("🧰 Maintenance", expanded=False):
                     hasd     = f"LEN(TO_TEXT({dd}))>0"
                     net_after= f"({prev_bal}+{paid_num}-{due_num})"
 
-                    pen_formula = f"=IF(AND({hasp}, {hasd}, {net_after} <= 0, {dpaid} >= {ddue} + 2), 3000, 0)"
+                    pen_formula = f"=IF(AND({hasp}, {hasd}, {net_after} <= 0, {dpaid} > {ddue} + 2), 3000, 0)"
                     if n == 1:
                         bal_formula = f"=({paid_num})-({due_num})-({pen_num})"
                     else:

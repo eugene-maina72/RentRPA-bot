@@ -409,7 +409,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
     net_after  = f"({prev_bal} + {paid_num} - {due_num})"
 
     # Updated penalty rule: >= due+2 AND net_after <= 0
-    pen_formula = f"=IF(AND({has_paid}, {has_due}, {net_after} <= 0, {dpaid_expr} >= {ddue_expr} + 2), 3000, 0)"
+    pen_formula = f"=IF(AND({has_paid}, {has_due}, {net_after} <= 0, {dpaid_expr} > {ddue_expr} + 2), 3000, 0)"
 
     # Balance formula (uniform for all rows, no first-payment override)
     if row_abs == header_row0 + 2:
@@ -493,7 +493,7 @@ def update_tenant_month_row(ws, payment: Dict, debug: Optional[List[str]] = None
         has_paid2   = f"LEN(TO_TEXT({dp2}))>0"
         has_due2    = f"LEN(TO_TEXT({dd2}))>0"
         net_after2  = f"({prev_bal2} + {paid_num2} - {due_num2})"
-        pen_formula2 = f"=IF(AND({has_paid2}, {has_due2}, {net_after2} <= 0, {dpaid2} >= {ddue2} + 2), 3000, 0)"
+        pen_formula2 = f"=IF(AND({has_paid2}, {has_due2}, {net_after2} <= 0, {dpaid2} > {ddue2} + 2), 3000, 0)"
         bal_formula2 = f"=({prev_bal2})+({paid_num2})-({due_num2})-({pen_num2})"
 
         _ensure_grid_size(ws, need_rows=row_abs2, need_cols=len(header))
