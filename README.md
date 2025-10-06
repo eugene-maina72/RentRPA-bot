@@ -1,8 +1,7 @@
-# 🏠 RentRPA — Technical Documentation & Operations Manual
+# 🏠 RentRPA — Rental Income Record keeping Automation (Technical Documentation & Operations Manual)
 
 > Version: 2.x • Updated: 2025-09 • Scope: Gmail → Google Sheets rent tracking for NCBA/M‑Pesa emails
 
-# 📊 Rental Income Record keeping Automation Bot 🏠
 
 <img src="images/rent%20bot.jpg" alt="Rent bot" width="400"/>
 
